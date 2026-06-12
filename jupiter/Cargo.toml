@@ -63,3 +63,9 @@ items_after_statements = "allow"
 result_large_err = "allow"
 doc_markdown = "allow"
 uninlined_format_args = "allow"
+
+[dev-dependencies]
+# Parity tests (`tests/parity.rs`) decode the litesvm-generated fixtures.
+solana-sdk = "2.2"
+serde_json = "1"
+base64 = "0.22"

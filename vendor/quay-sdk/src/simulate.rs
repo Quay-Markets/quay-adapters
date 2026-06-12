@@ -181,6 +181,29 @@ pub fn simulate_swap(inputs: SwapSimulationInputs<'_>) -> Result<SwapSimulation>
         0
     };
 
+    // Mirror `settle_inventory`'s structural solvency gate: on-chain, the
+    // OUT-side asset entry is debited `out_to_taker + protocol_cut` with
+    // `checked_sub` (and the IN side credited with `checked_add`) — a swap
+    // the inventory can't cover fails at settlement. Without this gate the
+    // simulator quotes fills the program will refuse.
+    let (inventory_in, inventory_out) = if inputs.side == SIDE_SELL_BASE {
+        (inventory_base, inventory_quote)
+    } else {
+        (inventory_quote, inventory_base)
+    };
+    let out_debit = out_to_taker
+        .checked_add(protocol_cut)
+        .ok_or(ClientError::SwapMathOverflow)?;
+    if out_debit > inventory_out {
+        return Err(ClientError::InsufficientInventory {
+            needed: out_debit,
+            available: inventory_out,
+        });
+    }
+    if inventory_in.checked_add(inputs.amount_in).is_none() {
+        return Err(ClientError::SwapMathOverflow);
+    }
+
     Ok(SwapSimulation {
         out_to_taker,
         protocol_cut,

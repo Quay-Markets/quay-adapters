@@ -2879,7 +2879,9 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "quay-sdk",
+ "serde_json",
  "solana-account",
  "solana-instruction",
  "solana-program",
@@ -2890,6 +2892,7 @@ dependencies = [
  "spl-token-2022 9.0.0",
  "thiserror 1.0.69",
  "titan-integration-template",
+ "tokio",
 ]
 
 [[package]]
