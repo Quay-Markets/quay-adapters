@@ -1,0 +1,102 @@
+[package]
+name = "quay-sdk"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "Off-chain client for the Quay program: instruction builders, account decoders, DSL helpers, and swap simulator. Aggregator-specific glue lives in the `aggregators/*` crates."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+quay-vm = { path = "../quay-vm", default-features = false, features = ["std"] }
+solana-program = "2.1"
+bytemuck = { version = "1", features = ["derive"] }
+thiserror = "1"
+
+[dev-dependencies]
+solana-program = "2.1"
+
+# Vendored copy of the off-chain SDK, trimmed to what the Titan adapter
+# needs (the DSL authoring/template modules are not included).
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+panic_in_result_fn = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+mem_forget = "deny"
+exit = "deny"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+module_name_repetitions = "allow"
+similar_names = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+missing_safety_doc = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_lossless = "allow"
+cast_precision_loss = "allow"
+inline_always = "allow"
+unreadable_literal = "allow"
+too_many_lines = "allow"
+struct_excessive_bools = "allow"
+too_many_arguments = "allow"
+match_same_arms = "allow"
+needless_pass_by_value = "allow"
+items_after_statements = "allow"
+single_match_else = "allow"
+range_plus_one = "allow"
+unused_self = "allow"
+default_trait_access = "allow"
+manual_let_else = "allow"
+unnested_or_patterns = "allow"
+identity_op = "allow"
+verbose_bit_mask = "allow"
+needless_range_loop = "allow"
+manual_range_contains = "allow"
+explicit_iter_loop = "allow"
+checked_conversions = "allow"
+unnecessary_cast = "allow"
+no_effect_underscore_binding = "allow"
+trivially_copy_pass_by_ref = "allow"
+let_underscore_untyped = "allow"
+manual_div_ceil = "allow"
+needless_borrow = "allow"
+result_large_err = "allow"
+doc_markdown = "allow"
+doc_link_with_quotes = "allow"
+doc_lazy_continuation = "allow"
+pub_underscore_fields = "allow"
+ptr_as_ptr = "allow"
+uninlined_format_args = "allow"
+useless_conversion = "allow"
+redundant_closure_for_method_calls = "allow"
+bool_to_int_with_if = "allow"
+enum_variant_names = "allow"
+stable_sort_primitive = "allow"
+map_unwrap_or = "allow"
+manual_midpoint = "allow"
+# Builder-pattern methods on `BytecodeBuilder` intentionally return `Self`
+# without `#[must_use]` because the chained-call shape makes accidental drops
+# obvious in practice.
+return_self_not_must_use = "allow"
+# `assigning_clones` would force `clone_from` on every `self.x = y.clone()`.
+# Hot paths in this crate are tiny (<300 B account blobs); the clarity of
+# the assignment outweighs the saved alloc.
+assigning_clones = "allow"
+# `needless_lifetimes` flags explicit `<'a>` on functions where elision works,
+# but we use them here for readability where the lifetime ties an output
+# slice to a specific input account.
+needless_lifetimes = "allow"
+# Method names like `neg`/`not`/`add`/`drop_` shadow std::ops trait methods —
+# intentional: `BytecodeBuilder` mirrors the VM opcode names exactly.
+should_implement_trait = "allow"
