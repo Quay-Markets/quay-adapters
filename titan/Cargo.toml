@@ -80,3 +80,10 @@ uninlined_format_args = "allow"
 # in `update_state`. The account blobs are tiny (<1 KiB each) and the
 # straight assignment reads more naturally.
 assigning_clones = "allow"
+
+[dev-dependencies]
+# Parity tests (`tests/parity.rs`) decode the litesvm-generated fixtures and
+# drive the async `update_state` through a fixed-map `AccountsCache`.
+tokio = { version = "1", features = ["macros", "rt"] }
+serde_json = "1"
+base64 = "0.22"

@@ -194,6 +194,13 @@ pub enum ClientError {
     #[error("slippage: out_to_taker {got} < min_amount_out {min}")]
     SlippageExceeded { got: u64, min: u64 },
 
+    /// The maker's OUT-side asset-table inventory can't cover
+    /// `out_to_taker + protocol_cut`. The on-chain swap fails the same way
+    /// (`settle_inventory`'s `checked_sub` solvency gate), so a quote in
+    /// this state would route a doomed transaction.
+    #[error("insufficient maker inventory: need {needed} OUT atoms, have {available}")]
+    InsufficientInventory { needed: u64, available: u64 },
+
     #[error("agg_swap: no candidate strategy produced a usable quote")]
     NoEligibleStrategy,
 

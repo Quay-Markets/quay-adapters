@@ -1524,9 +1524,12 @@ name = "quay-aggregator-jupiter"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "jupiter-amm-interface",
  "quay-sdk",
+ "serde_json",
  "solana-program",
+ "solana-sdk",
 ]
 
 [[package]]
