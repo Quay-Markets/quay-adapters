@@ -1,18 +1,10 @@
-[package]
-name = "quay-aggregator-titan"
-version = "0.0.1"
-# Titan's `titan-integration-template` itself is `edition = "2024"` (requires
-# rustc >= 1.85). Mirror that so the `async_trait` impl + `solana-*` 2.2 deps
-# pulled in from the template line up cleanly.
-edition = "2024"
-license = "MIT"
-description = "Titan `TradingVenue` adapter for the Quay program. Plug-in for routers using `titan-integration-template`."
-
-[lib]
-path = "src/lib.rs"
-
 [workspace]
-members = ["vendor/quay-sdk", "vendor/quay-vm"]
+resolver = "2"
+members = ["titan", "vendor/quay-sdk", "vendor/quay-vm"]
+# `jupiter` is its own workspace (own Cargo.lock): `jupiter-amm-interface 0.6`
+# pins `solana-instruction = 2.2.1` exactly, which conflicts with the 2.3.x
+# line the titan template graph resolves. Build it from `jupiter/`.
+exclude = ["jupiter"]
 
 # Inherited by the vendored crates (`version.workspace = true` etc.).
 [workspace.package]
@@ -20,76 +12,6 @@ version = "0.0.1"
 edition = "2021"
 license = "MIT"
 authors = ["Quay Markets"]
-
-[dependencies]
-# `quay-sdk` is the off-chain SDK (instruction builders, PDAs, zero-copy
-# decoders, swap simulator). Vendored together with `quay-vm` (the pricing
-# VM the simulator runs) so this repo builds standalone.
-quay-sdk = { path = "vendor/quay-sdk" }
-
-# Titan's open-source integration template. The `TradingVenue` trait this
-# crate implements lives in `src/trading_venue/mod.rs`. Pinned to a commit
-# (NOT a branch) so a force-push or trait-rename upstream can't silently
-# break our build. The trait is `#[async_trait]` so we need the same
-# proc-macro in lockstep.
-titan-integration-template = { git = "https://github.com/Titan-Pathfinder/integration-template", rev = "b3f179e79a0ad54d897a1f62c9b0888e6b5c0b7f" }
-
-# Titan's template is pinned to `solana-* 2.2.x`. We mirror those caps so the
-# `Pubkey` / `Instruction` types resolve to the same crates the template's
-# trait signatures use, otherwise the `#[async_trait]` impl won't compile.
-solana-program = "2.2"
-solana-pubkey = "2.2"
-solana-instruction = "2.2"
-solana-account = "2.2"
-solana-sdk-ids = "2.2"
-
-# Mint decimals come from the SPL Mint account. `spl-token-2022` handles
-# both the legacy SPL Token layout and Token-2022 (it's a superset). We
-# still pull `spl-token` for the canonical program id constant.
-spl-token = { version = "7", features = ["no-entrypoint"] }
-spl-token-2022 = { version = "^9", features = ["no-entrypoint"] }
-spl-associated-token-account = "6"
-
-async-trait = "0.1"
-thiserror = "1"
-anyhow = "1"
-
-[lints.rust]
-unsafe_op_in_unsafe_fn = "warn"
-
-[lints.clippy]
-pedantic = { level = "warn", priority = -1 }
-panic_in_result_fn = "deny"
-todo = "deny"
-unimplemented = "deny"
-dbg_macro = "deny"
-mem_forget = "deny"
-exit = "deny"
-unwrap_used = "warn"
-expect_used = "warn"
-panic = "warn"
-module_name_repetitions = "allow"
-similar_names = "allow"
-must_use_candidate = "allow"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-cast_possible_truncation = "allow"
-cast_possible_wrap = "allow"
-cast_sign_loss = "allow"
-cast_lossless = "allow"
-cast_precision_loss = "allow"
-unreadable_literal = "allow"
-too_many_lines = "allow"
-too_many_arguments = "allow"
-needless_pass_by_value = "allow"
-items_after_statements = "allow"
-result_large_err = "allow"
-doc_markdown = "allow"
-uninlined_format_args = "allow"
-# `assigning_clones` would force `clone_from` on every `self.x = y.clone()`
-# in `update_state`. The account blobs are tiny (<1 KiB each) and the
-# straight assignment reads more naturally.
-assigning_clones = "allow"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Workspace lint config — inherited by `vendor/quay-vm` via
