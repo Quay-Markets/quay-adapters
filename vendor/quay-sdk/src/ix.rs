@@ -13,8 +13,9 @@ use solana_program::system_program;
 use crate::consts::{
     AGG_N, DISC_AGG_SWAP, DISC_CLOSE_QUOTES, DISC_DEPOSIT_ASSET, DISC_EDIT_MARKET_MAKER_STATUS,
     DISC_EDIT_PLATFORM_CONFIG, DISC_EDIT_STRATEGY_FEES, DISC_EDIT_STRATEGY_STATUS,
-    DISC_FREEZE_MARKET_MAKER, DISC_HALT_MARKET_MAKER, DISC_INIT_GLOBAL, DISC_INIT_MARKET_MAKER,
-    DISC_INIT_QUOTES, DISC_INIT_STRATEGY, DISC_RESIZE_USERSPACE, DISC_SET_USERSPACE, DISC_SWAP,
+    DISC_INIT_GLOBAL, DISC_INIT_MARKET_MAKER,
+    DISC_INIT_QUOTES, DISC_INIT_STRATEGY, DISC_RESIZE_USERSPACE,
+    DISC_SET_MARKET_MAKER_ADMIN, DISC_SET_USERSPACE, DISC_SWAP,
     DISC_UPDATE_QUOTES, DISC_UPDATE_STRATEGY_BYTECODE, DISC_UPDATE_STRATEGY_QUOTES,
     DISC_WITHDRAW_ASSET, DISC_WITHDRAW_PROTOCOL_FEES, QUOTES_NUM_SLOTS,
 };
@@ -49,6 +50,7 @@ pub fn init_global(program_id: &Pubkey, payer: &Pubkey) -> Instruction {
 
 /// `edit_platform_config` (0x01). `mask` selects which fields to write
 /// (`CFG_MASK_*`). Unselected fields are ignored.
+#[allow(clippy::too_many_arguments)]
 pub fn edit_platform_config(
     program_id: &Pubkey,
     admin: &Pubkey,
@@ -56,10 +58,12 @@ pub fn edit_platform_config(
     swap_halted: u8,
     protocol_halted: u8,
     new_admin: &Pubkey,
+    default_protocol_fee_bps: u16,
 ) -> Instruction {
     let (cfg, _) = pda::global_config_pda(program_id);
     let mut data = vec![DISC_EDIT_PLATFORM_CONFIG, mask, swap_halted, protocol_halted];
     data.extend_from_slice(new_admin.as_ref());
+    data.extend_from_slice(&default_protocol_fee_bps.to_le_bytes());
     Instruction {
         program_id: *program_id,
         accounts: vec![meta_w(&cfg), meta_signer_r(admin)],
@@ -223,29 +227,30 @@ pub fn edit_market_maker_status(
     }
 }
 
-fn mm_admin_flag_ix(
+/// Mask bits for `set_market_maker_admin`.
+pub const MM_ADMIN_MASK_FROZEN: u8 = 0b001;
+pub const MM_ADMIN_MASK_HALTED: u8 = 0b010;
+pub const MM_ADMIN_MASK_PERMISSIONLESS: u8 = 0b100;
+
+/// `set_market_maker_admin` (0x0B). Admin sets `frozen_admin`, `halted_admin`,
+/// and `permissionless_strategies`; `mask` selects which to write (see the
+/// `MM_ADMIN_MASK_*` bits). Mirrors `edit_platform_config`. Accounts:
+/// `[mm(w), cfg, admin(s)]`.
+pub fn set_market_maker_admin(
     program_id: &Pubkey,
-    disc: u8,
     mm: &Pubkey,
     admin: &Pubkey,
-    mode: u8,
+    mask: u8,
+    frozen_admin: u8,
+    halted_admin: u8,
+    permissionless: u8,
 ) -> Instruction {
     let (cfg, _) = pda::global_config_pda(program_id);
     Instruction {
         program_id: *program_id,
         accounts: vec![meta_w(mm), meta_r(&cfg), meta_signer_r(admin)],
-        data: vec![disc, mode],
+        data: vec![DISC_SET_MARKET_MAKER_ADMIN, mask, frozen_admin, halted_admin, permissionless],
     }
-}
-
-/// `freeze_market_maker` (0x0B). Admin toggles `frozen_admin`.
-pub fn freeze_market_maker(program_id: &Pubkey, mm: &Pubkey, admin: &Pubkey, mode: u8) -> Instruction {
-    mm_admin_flag_ix(program_id, DISC_FREEZE_MARKET_MAKER, mm, admin, mode)
-}
-
-/// `halt_market_maker` (0x0C). Admin toggles `halted_admin`.
-pub fn halt_market_maker(program_id: &Pubkey, mm: &Pubkey, admin: &Pubkey, mode: u8) -> Instruction {
-    mm_admin_flag_ix(program_id, DISC_HALT_MARKET_MAKER, mm, admin, mode)
 }
 
 /// `withdraw_protocol_fees` (0x0D). Admin drains one asset slot's accrued fees.
@@ -282,21 +287,23 @@ pub fn withdraw_protocol_fees(
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Wire-prefix length for `init_strategy`: id(1) + base_id(2) + quote_id(2)
-/// + protocol_fee_bps(2) + bytecode_len(4) + userspace_len(4).
-const INIT_STRATEGY_PREFIX: usize = 1 + 2 + 2 + 2 + 4 + 4;
+/// + bytecode_len(4) + userspace_len(4). The protocol fee comes from the
+/// global default, not the wire.
+const INIT_STRATEGY_PREFIX: usize = 1 + 2 + 2 + 4 + 4;
 
-/// `init_strategy` (0x10). Admin creates the strategy for `owner`; born frozen.
-/// `quotes_account` optionally binds a quotes feed at creation.
+/// `init_strategy` (0x10). The MM `owner` signs and pays for its own strategy;
+/// the MM must be live (not frozen/halted). Born frozen by the owner, and also
+/// `frozen_admin` unless the MM is permissionless (set by the admin). The
+/// protocol fee is taken from `GlobalConfig.default_protocol_fee_bps`.
+/// `quotes_account` optionally binds a feed at creation.
 #[allow(clippy::too_many_arguments)]
 pub fn init_strategy(
     program_id: &Pubkey,
-    admin: &Pubkey,
     owner: &Pubkey,
     mm: &Pubkey,
     id: u8,
     base_id: u16,
     quote_id: u16,
-    protocol_fee_bps: u16,
     bytecode: &[u8],
     userspace_len: u32,
     quotes_account: Option<&Pubkey>,
@@ -308,7 +315,6 @@ pub fn init_strategy(
     data.push(id);
     data.extend_from_slice(&base_id.to_le_bytes());
     data.extend_from_slice(&quote_id.to_le_bytes());
-    data.extend_from_slice(&protocol_fee_bps.to_le_bytes());
     data.extend_from_slice(&(bytecode.len() as u32).to_le_bytes());
     data.extend_from_slice(&userspace_len.to_le_bytes());
     data.extend_from_slice(bytecode);
@@ -316,8 +322,7 @@ pub fn init_strategy(
         meta_w(&strategy),
         meta_r(mm),
         meta_r(&cfg),
-        meta_r(owner),
-        meta_signer_w(admin),
+        meta_signer_w(owner),
         meta_r(&system_program::ID),
     ];
     if let Some(q) = quotes_account {
@@ -626,11 +631,11 @@ mod tests {
     #[test]
     fn init_strategy_wire_prefix() {
         let k = Pubkey::new_unique();
-        let ix = init_strategy(&pid(), &k, &k, &k, 3, 0, 1, 250, &[0xAA, 0xBB], 64, None);
+        let ix = init_strategy(&pid(), &k, &k, 3, 0, 1, &[0xAA, 0xBB], 64, None);
         assert_eq!(ix.data[0], DISC_INIT_STRATEGY);
         assert_eq!(ix.data[1], 3); // id
         assert_eq!(ix.data.len(), 1 + INIT_STRATEGY_PREFIX + 2);
-        assert_eq!(ix.accounts.len(), 6); // no quotes account
+        assert_eq!(ix.accounts.len(), 5); // strategy, mm, cfg, owner, system (no quotes)
     }
 
     #[test]

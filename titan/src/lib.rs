@@ -56,6 +56,7 @@ use spl_associated_token_account::get_associated_token_address_with_program_id;
 
 use quay_sdk::consts::{SIDE_BUY_BASE, SIDE_SELL_BASE, SWAP_LOADED_ACCOUNTS_DATA_SIZE_LIMIT};
 use quay_sdk::ix;
+use quay_sdk::is_stateless;
 use quay_sdk::pda;
 use quay_sdk::simulate::{simulate_swap, SwapSimulationInputs};
 use quay_sdk::state::{GlobalConfig, MarketMakerHeader, StrategyHeader};
@@ -171,6 +172,26 @@ pub struct QuayVenue {
     /// `[base, quote]` `TokenInfo` (mints + decimals + Token-2022 program
     /// detection). Populated by `update_state`; empty before the first call.
     tokens: Vec<TokenInfo>,
+
+    /// Is the strategy's pricing bytecode **stateless** (no `StoreI64`
+    /// userspace writes)? Computed via `quay_vm::is_stateless` at construction
+    /// and refreshed each `update_state`.
+    ///
+    /// Aggregator adapters must refuse **stateful** curves — this is the VM's
+    /// documented "aggregator-routing contract" (`quay_vm::is_stateless`): a
+    /// router caches `simulate_swap` between the quote and the on-chain fill,
+    /// but a stateful curve mutates `userspace` mid-swap, so on-chain state
+    /// drifts from the cached view and the user's fill diverges from the
+    /// quote. Stateful curves are meant for direct integrations, not routers.
+    /// (Refusing them also keeps `quote()` allocation-free: `simulate_swap`
+    /// clones a non-empty `userspace` only for stateful curves, which would
+    /// break Titan's no-heap-in-quoting rule.)
+    ///
+    /// Unlike the halt bytes, this needs no warm-up default: the pricing
+    /// bytecode lives in the Strategy account `from_account` already holds, so
+    /// it is computed correctly at construction. (It still gates nothing until
+    /// `has_all_state()` is also true post-`update_state`.)
+    stateless: bool,
 
     /// Cached halt / freeze bytes — same set the on-chain `execute_swap`
     /// enforces, mirroring `aggregators/jupiter`'s [`QuayAmm`]. Every flag
@@ -295,6 +316,17 @@ impl QuayVenue {
     }
 }
 
+/// Whether a strategy's pricing bytecode is stateless (carries no `StoreI64`
+/// userspace write). Conservatively returns `false` when the bytecode region
+/// can't be read — an undecodable strategy is treated as ineligible for
+/// routing, matching `quay_vm::is_stateless`'s own malformed-input handling.
+fn strategy_is_stateless(strategy: &StrategyHeader, strategy_data: &[u8]) -> bool {
+    strategy
+        .bytecode(strategy_data)
+        .map(is_stateless)
+        .unwrap_or(false)
+}
+
 /// Read an SPL token account's `amount` (u64 LE at bytes 64..72). Caller
 /// must verify `data.len() >= 72`; replaces an earlier `try_into().unwrap()`
 /// against the zero-warnings policy.
@@ -329,6 +361,8 @@ impl FromAccount for QuayVenue {
         let (vault_base_key, _) = pda::vault_pda(&program_id, &mm_key, &base_mint);
         let (vault_quote_key, _) = pda::vault_pda(&program_id, &mm_key, &quote_mint);
 
+        let stateless = strategy_is_stateless(strategy, &account.data);
+
         Ok(Self {
             program_id,
             strategy_key: *pubkey,
@@ -346,6 +380,7 @@ impl FromAccount for QuayVenue {
             vault_base_data: Vec::new(),
             vault_quote_data: Vec::new(),
             tokens: Vec::new(),
+            stateless,
             // Default to 1 (active-halt) so `initialized()` returns false
             // until the first `update_state` decodes real flag bytes.
             cfg_swap_halted: 1,
@@ -370,14 +405,21 @@ impl FromAccount for QuayVenue {
 #[async_trait]
 impl TradingVenue for QuayVenue {
     fn initialized(&self) -> bool {
-        // Three gates Titan's route planner uses to skip the venue:
+        // Four gates Titan's route planner uses to skip the venue:
         //   1. all account blobs populated (post-first-update),
         //   2. on-chain halt / freeze set clear (the same flags the swap
         //      handler checks — see `onchain/program/src/instructions/swap.rs`),
         //   3. neither mint carries a Token-2022 `TransferFeeConfig`
         //      extension (the on-chain swap prices `amount_in` gross and
-        //      would short-fill against the curve's quoted output).
-        self.has_all_state() && self.halts_clear() && !self.any_transfer_fee()
+        //      would short-fill against the curve's quoted output),
+        //   4. the pricing curve is stateless (see `stateless` — the VM's
+        //      aggregator-routing contract: a router caches the quote, so a
+        //      stateful curve's mid-swap userspace writes would drift the
+        //      fill away from the quote).
+        self.has_all_state()
+            && self.halts_clear()
+            && !self.any_transfer_fee()
+            && self.stateless
     }
 
     fn program_id(&self) -> Pubkey {
@@ -454,6 +496,9 @@ impl TradingVenue for QuayVenue {
         })?;
         self.strategy_frozen = strategy.frozen;
         self.strategy_frozen_admin = strategy.frozen_admin;
+        // Bytecode can change via `update_strategy_bytecode`, so re-derive the
+        // statelessness gate every refresh, not just at construction.
+        self.stateless = strategy_is_stateless(strategy, &self.strategy_data);
 
         // Slot 1 — MarketMaker (asset table + admin halts).
         let mm_account = accounts[1]
@@ -563,10 +608,17 @@ impl TradingVenue for QuayVenue {
         };
 
         // Mirror `initialized()`: state populated AND halts clear AND no
-        // transfer-fee mints. The simulator would also reject on the halt
-        // bytes (`client/sdk/src/simulate.rs`), but failing here gives the
-        // router a single canonical "not initialized" surface to skip.
-        if !self.has_all_state() || !self.halts_clear() || self.any_transfer_fee() {
+        // transfer-fee mints AND a stateless curve. The simulator would also
+        // reject on the halt bytes (`client/sdk/src/simulate.rs`), but failing
+        // here gives the router a single canonical "not initialized" surface
+        // to skip. Refusing stateful curves before `simulate_swap` also keeps
+        // this path allocation-free (the simulator clones a non-empty
+        // userspace only for stateful curves).
+        if !self.has_all_state()
+            || !self.halts_clear()
+            || self.any_transfer_fee()
+            || !self.stateless
+        {
             return Err(TradingVenueError::NotInitialized(self.strategy_key.into()));
         }
 
@@ -771,6 +823,7 @@ mod tests {
             vault_base_data: Vec::new(),
             vault_quote_data: Vec::new(),
             tokens: Vec::new(),
+            stateless: true,
             cfg_swap_halted: 0,
             cfg_protocol_halted: 0,
             strategy_frozen: 0,
@@ -822,6 +875,20 @@ mod tests {
         let mut venue = all_active_venue();
         venue.mm_data.clear();
         assert!(!venue.initialized(), "empty mm_data should fail initialized()");
+    }
+
+    #[test]
+    fn initialized_false_when_stateful() {
+        // A stateful curve (one that writes userspace via `StoreI64`) violates
+        // the VM's aggregator-routing contract — the router caches the quote,
+        // so mid-swap userspace writes drift the on-chain fill. The venue must
+        // refuse to route it.
+        let mut venue = all_active_venue();
+        venue.stateless = false;
+        assert!(
+            !venue.initialized(),
+            "stateful curve should fail initialized()"
+        );
     }
 
     #[test]

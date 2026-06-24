@@ -25,7 +25,9 @@ pub struct GlobalConfig {
     pub schema_version: u8,
     pub swap_halted: u8,
     pub protocol_halted: u8,
-    pub _pad: [u8; 4],
+    /// Protocol fee (bps) stamped onto every new strategy at creation.
+    pub default_protocol_fee_bps: u16,
+    pub _pad: [u8; 2],
     pub admin: [u8; 32],
     pub _reserved_a: [u8; 64],
     pub _reserved_b: [u8; 24],
@@ -163,7 +165,10 @@ pub struct MarketMakerHeader {
     pub _pad: [u8; 3],
     pub owner: [u8; 32],
     pub asset_count: u32,
-    pub _reserved: [u8; 20],
+    /// Admin review gate: when `0`, owner-created strategies are born
+    /// `frozen_admin` (admin must validate); when `1`, they skip admin review.
+    pub permissionless_strategies: u8,
+    pub _reserved: [u8; 19],
 }
 
 impl MarketMakerHeader {
