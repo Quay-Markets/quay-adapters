@@ -87,3 +87,18 @@ assigning_clones = "allow"
 tokio = { version = "1", features = ["macros", "rt"] }
 serde_json = "1"
 base64 = "0.22"
+# `tests/test_construction.rs` wraps `quote()` in `assert_no_alloc` to prove
+# the quoting hot path performs no heap allocation — Titan's construction-test
+# requirement. Same crate the integration template uses for the check.
+assert_no_alloc = "1.1"
+# `tests/simulations.rs` (Titan's "Simulation Tests (Critical)" category) loads
+# the compiled Quay program into LiteSVM and executes the adapter's own
+# `generate_swap_instruction`, asserting the on-chain fill equals `quote()`.
+# litesvm 0.6 resolves on the same `solana-* 2.2` line as the adapter, so it
+# composes without a version conflict. The `.so` is located via the
+# `QUAY_PROGRAM_SO` env var or the monorepo `target/deploy` path; the test
+# skips when neither is present (e.g. the standalone export repo).
+litesvm = "0.6"
+solana-keypair = "2.2"
+solana-signer = "2.2"
+solana-transaction = "2.2"
