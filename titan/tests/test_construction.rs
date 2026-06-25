@@ -7,9 +7,11 @@
 //! - quotes at both `bounds()` boundaries,
 //! - performs **no heap allocation** in `quote()` — the quoting hot path must
 //!   be real-time (Titan's hard requirement, checked via `assert_no_alloc`),
-//! - refuses **stateful** curves — the VM's aggregator-routing contract
-//!   (`quay_vm::is_stateless`): a router caches the quote, so a curve that
-//!   writes `userspace` mid-swap drifts the on-chain fill away from the quote.
+//! - routes **stateful** curves too — a curve that writes `userspace`
+//!   mid-swap is priced alloc-free on a fixed stack buffer; the resulting
+//!   quote/fill drift is bounded by the route's `min_amount_out` slippage
+//!   guard (worst case a reverted route, never a loss), so it is routed
+//!   rather than refused.
 //!
 //! Driven by the same litesvm-generated fixtures as `tests/parity.rs`.
 
