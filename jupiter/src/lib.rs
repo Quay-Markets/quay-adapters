@@ -18,8 +18,8 @@
 //!    + halt flags),
 //! 3. the strategy's bound **Quotes** account (live quote slots + freshness),
 //! 4. **GlobalConfig** (halt flags),
-//! 5. and 6. the base and quote **vault** token accounts (for `LoadVaultBase` /
-//!    `LoadVaultQuote` curve inputs),
+//! 5. and 6. the base and quote **vault** token accounts (swap-ix accounts
+//!    only — the VM no longer prices off vault balances),
 //! 7. and 8. the base and quote **mints** (decimals + Token-2022 owner +
 //!    `TransferFeeConfig` detection for the `is_active()` gate).
 //!
@@ -50,10 +50,12 @@ use jupiter_amm_interface::{
 use solana_program::instruction::AccountMeta;
 use solana_program::pubkey::Pubkey;
 
-use quay_sdk::consts::{SIDE_BUY_BASE, SIDE_SELL_BASE, SWAP_LOADED_ACCOUNTS_DATA_SIZE_LIMIT};
+use quay_sdk::consts::{
+    MAX_USERSPACE_LEN, SIDE_BUY_BASE, SIDE_SELL_BASE, SWAP_LOADED_ACCOUNTS_DATA_SIZE_LIMIT,
+};
 use quay_sdk::ix;
 use quay_sdk::pda;
-use quay_sdk::simulate::{simulate_swap, SwapSimulationInputs};
+use quay_sdk::simulate::{simulate_swap_in, SwapSimulationInputs};
 use quay_sdk::state::{GlobalConfig, MarketMakerHeader, StrategyHeader};
 
 /// Swap account count for a **same-token-program** market. Mirrors the
@@ -458,19 +460,27 @@ impl Amm for QuayAmm {
         let current_slot = self.clock.slot.load(Ordering::Relaxed);
         let current_unix_sec = self.clock.unix_timestamp.load(Ordering::Relaxed);
 
-        let sim = simulate_swap(SwapSimulationInputs {
-            strategy_data: &self.strategy_data,
-            market_maker_data: &self.mm_data,
-            quotes_data: &self.quotes_data,
-            global_config_data: &self.global_config_data,
-            current_slot,
-            current_unix_sec,
-            side,
-            amount_in: quote_params.amount,
-            min_amount_out: 0,
-            base_decimals: self.base_decimals,
-            quote_decimals: self.quote_decimals,
-        })
+        // Price into a stack scratch buffer so `quote()` performs no heap
+        // allocation, for every curve — stateful or not. `MAX_USERSPACE_LEN`
+        // (16 KiB) is the program's hard cap on userspace, so it fits any
+        // strategy.
+        let mut scratch = [0u8; MAX_USERSPACE_LEN as usize];
+        let sim = simulate_swap_in(
+            SwapSimulationInputs {
+                strategy_data: &self.strategy_data,
+                market_maker_data: &self.mm_data,
+                quotes_data: &self.quotes_data,
+                global_config_data: &self.global_config_data,
+                current_slot,
+                current_unix_sec,
+                side,
+                amount_in: quote_params.amount,
+                min_amount_out: 0,
+                base_decimals: self.base_decimals,
+                quote_decimals: self.quote_decimals,
+            },
+            &mut scratch,
+        )
         .map_err(|e| anyhow!("simulate_swap: {e}"))?;
 
         // Protocol cut is skimmed from the INPUT (DSL-v1 fee model): the fee

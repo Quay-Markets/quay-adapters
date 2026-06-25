@@ -55,8 +55,10 @@ pub const ASSET_ID_NEW: u16 = 0xFFFF;
 
 // ── Fee / size math ──────────────────────────────────────────────────────────
 pub const FEE_BPS_DENOM: u64 = 10_000;
-/// Maximum strategy userspace region, in bytes (1 MiB).
-pub const MAX_USERSPACE_LEN: u32 = 1 << 20;
+/// Maximum strategy userspace region, in bytes (16 KiB). Mirrors
+/// `onchain/program/src/state.rs::MAX_USERSPACE_LEN` — sized so off-chain
+/// integrators can price on a fixed stack buffer with zero heap allocation.
+pub const MAX_USERSPACE_LEN: u32 = 1 << 14;
 
 // ── Curve price scale (Q24) ──────────────────────────────────────────────────
 //

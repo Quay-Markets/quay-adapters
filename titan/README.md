@@ -97,7 +97,7 @@ venue.set_clock(slot, ts);
 Note: the next `update_state` will overwrite both fields from the live
 sysvar. Use the override only when the next caller is `quote()`.
 
-## Halt-gate mirror + transfer-fee + stateless refusal
+## Halt-gate mirror + transfer-fee refusal
 
 `initialized()` and `quote()` both gate on:
 
@@ -105,16 +105,20 @@ sysvar. Use the override only when the next caller is `quote()`.
   `!strategy.{frozen,frozen_admin}` ∧ `!mm.{frozen,frozen_admin,halted_admin}`;
 - **no transfer-fee mints** — the on-chain swap prices `amount_in` gross, so a
   Token-2022 `TransferFeeConfig` mint would short-fill against the curve's
-  quoted output;
-- a **stateless** pricing curve (`quay_vm::is_stateless`) — the VM's
-  aggregator-routing contract. A router caches `simulate_swap` between the
-  quote and the on-chain fill, but a stateful curve (one that writes
-  `userspace` via `StoreI64`) mutates state mid-swap, so the cached quote
-  drifts from the actual fill. Stateful curves are for direct integrations;
-  the venue refuses to route them. (This also keeps `quote()` allocation-free:
-  the simulator clones a non-empty `userspace` only for stateful curves.)
+  quoted output.
 
-The venue stays "not initialized" whenever any of these does not hold.
+The venue stays "not initialized" whenever either does not hold.
+
+## All curves, allocation-free
+
+The adapter routes **every** curve, stateful or not. `quote()` prices on a
+fixed-size stack scratch buffer (`MAX_USERSPACE_LEN` = 16 KiB, the program's
+hard cap on userspace) via `quay_sdk::simulate::simulate_swap_in`, so the
+quoting hot path performs **no heap allocation** for any strategy. A stateful
+curve's price can drift between the cached quote and the on-chain fill (the
+curve mutates its own state mid-swap), but that drift is bounded by the route's
+slippage guard — worst case a reverted route, never a loss — so it is left to
+the router rather than refused here.
 
 ## Tests
 
@@ -124,7 +128,7 @@ Three suites, all driven by the `fixtures/*.json` snapshots:
   amount sweep on both sides.
 - `tests/test_construction.rs` — Titan's construction & boundary category:
   state load, token info, `bounds()` quotes, `assert_no_alloc` over the
-  quoting hot path, and stateful-curve refusal.
+  quoting hot path, and a stateful curve quoting allocation-free.
 - `tests/simulations.rs` — Titan's simulation category: loads the compiled
   program into LiteSVM and executes the adapter's own
   `generate_swap_instruction`, asserting the on-chain fill equals `quote()`.
