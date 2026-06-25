@@ -122,7 +122,8 @@ the router rather than refused here.
 
 ## Tests
 
-Three suites, all driven by the `fixtures/*.json` snapshots:
+Three offline suites run by default, all driven by the `fixtures/*.json`
+snapshots (no network):
 
 - `tests/parity.rs` — `quote()` reproduces the recorded on-chain fill for an
   amount sweep on both sides.
@@ -135,3 +136,19 @@ Three suites, all driven by the `fixtures/*.json` snapshots:
   Runs with no setup against the bundled `fixtures/quay_program.so` (the same
   program build the fixtures were generated from). Override with
   `QUAY_PROGRAM_SO=/path/to/quay_program.so` to test a different build.
+
+### Live mainnet e2e (opt-in)
+
+`tests/mainnet.rs` drives the adapter against **real Quay strategies** over
+JSON-RPC — the full `from_account` → `update_state` → `quote` flow a router
+runs, plus an `assert_no_alloc` check on a live strategy. It is **`#[ignore]`'d
+so it never runs as part of `cargo test`** (it needs network and an RPC
+endpoint, and on-chain prices/inventory change over time). Run it explicitly:
+
+```bash
+RPC_URL='https://your-mainnet-rpc' \
+  cargo test -p quay-aggregator-titan --test mainnet -- --ignored --nocapture
+```
+
+`RPC_URL` is read from the environment (never hard-coded); with it unset the
+test prints a notice and returns.
