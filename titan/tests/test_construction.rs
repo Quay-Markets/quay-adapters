@@ -28,6 +28,7 @@ use std::str::FromStr;
 use assert_no_alloc::{assert_no_alloc, AllocDisabler};
 use async_trait::async_trait;
 use quay_aggregator_titan::QuayVenue;
+use quay_sdk::dsl::BytecodeBuilder;
 use solana_account::Account;
 use solana_pubkey::Pubkey;
 use titan_integration_template::account_caching::{AccountCacheError, AccountsCache};
@@ -230,38 +231,56 @@ async fn quote_does_not_allocate() {
     }
 }
 
-/// All curves are routable — including stateful ones — and `quote()` prices
-/// them with zero heap allocation on a fixed stack buffer. We take the `flat`
-/// fixture's strategy, splice a `StoreI64` into its bytecode (so the old
-/// statelessness gate would have refused it) and grow `userspace_len` so the
-/// no-alloc path actually copies a non-empty userspace, then assert the venue
-/// initializes and quotes without allocating.
+/// All curves are routable — including genuinely stateful ones — and `quote()`
+/// prices them with zero heap allocation even when the strategy carries a
+/// non-empty `userspace` the simulator must copy into its stack scratch buffer.
+///
+/// We splice a real counter curve (built with `quay_sdk::dsl::BytecodeBuilder`)
+/// into the `flat` fixture: it bumps a per-side counter in `userspace` on the
+/// live path — so `quay_vm::is_stateless` is false and the old statelessness
+/// gate would have refused it — and grows `userspace_len` to 16 so the no-alloc
+/// copy moves real bytes. The curve still prices flat 1:1, so the quote equals
+/// the input amount.
+///
+/// One test, three guards:
+///   1. a stateful-classified curve is routed (`initialized()` is true), not
+///      refused — guards against re-introducing a statelessness gate;
+///   2. `quote()` is alloc-free across the *live* load + store + price path,
+///      with a non-empty userspace the copy actually moves (the prior version
+///      used a `StoreI64` after `Halt` — dead code — and an empty copy);
+///   3. the bookkeeping store doesn't perturb pricing (still 1:1).
 #[tokio::test]
 async fn routes_stateful_strategy_alloc_free() {
-    // StrategyHeader layout: `bytecode_len` u32 LE at offset 144,
-    // `userspace_len` at 148. The `flat` fixture has bytecode_len=10,
-    // userspace_len=0, with bytecode then userspace as the account's tail.
+    // StrategyHeader: `bytecode_len` u32 LE @144, `userspace_len` @148, the
+    // 192-byte header followed by bytecode then userspace as the account tail.
+    const HEADER_LEN: usize = 192;
     const BYTECODE_LEN_OFF: usize = 144;
     const USERSPACE_LEN_OFF: usize = 148;
-    const OP_STORE_I64: u8 = 0x48; // a userspace-mutating op → bytecode is "stateful".
     const US_LEN: u32 = 16;
+
+    // Flat 1:1 pricer that also increments a per-side counter in userspace
+    // (sell @0, buy @8). The store runs on the live path, so the bytecode is
+    // genuinely stateful — not a dead `StoreI64` after `Halt`.
+    fn build_counter_curve() -> Vec<u8> {
+        let (b, to_sell) = BytecodeBuilder::new().load_side().load_const(0).start_if_eq();
+        let b = b.load_i64(8).load_const(1).add().store_i64(8); // buy:  buys + 1
+        let (b, to_price) = b.start_jmp();
+        let b = b.patch(to_sell).load_i64(0).load_const(1).add().store_i64(0); // sell: sells + 1
+        b.patch(to_price).load_size().halt().build() // flat 1:1
+    }
 
     let mut f = load_fixture("flat");
     let mut strat = f.accounts.get(&f.strategy).expect("strategy").clone();
 
-    let bc_len = u32::from_le_bytes(
-        strat.data[BYTECODE_LEN_OFF..BYTECODE_LEN_OFF + 4]
-            .try_into()
-            .unwrap(),
-    );
-    // Append `StoreI64 <0>` (opcode + u32 imm) *after* the curve's `Halt` — dead
-    // code at runtime, but it makes the bytecode stateful by `is_stateless`.
-    strat.data.extend_from_slice(&[OP_STORE_I64, 0, 0, 0, 0]);
-    strat.data[BYTECODE_LEN_OFF..BYTECODE_LEN_OFF + 4]
-        .copy_from_slice(&(bc_len + 5).to_le_bytes());
-    // Grow userspace so the no-alloc copy handles a non-empty buffer.
-    strat.data.extend_from_slice(&[0u8; US_LEN as usize]);
-    strat.data[USERSPACE_LEN_OFF..USERSPACE_LEN_OFF + 4].copy_from_slice(&US_LEN.to_le_bytes());
+    // Replace the bytecode with the counter curve and give it a 16-byte
+    // (zeroed) userspace.
+    let bc = build_counter_curve();
+    let mut data = strat.data[..HEADER_LEN].to_vec();
+    data.extend_from_slice(&bc);
+    data.extend_from_slice(&[0u8; US_LEN as usize]);
+    data[BYTECODE_LEN_OFF..BYTECODE_LEN_OFF + 4].copy_from_slice(&(bc.len() as u32).to_le_bytes());
+    data[USERSPACE_LEN_OFF..USERSPACE_LEN_OFF + 4].copy_from_slice(&US_LEN.to_le_bytes());
+    strat.data = data;
     f.accounts.insert(f.strategy, strat.clone());
 
     let mut venue = QuayVenue::from_account(&f.strategy, &strat).expect("from_account");
@@ -270,10 +289,9 @@ async fn routes_stateful_strategy_alloc_free() {
         .await
         .expect("update_state");
 
-    assert!(
-        venue.initialized(),
-        "stateful strategy should now be routable"
-    );
+    // Guard 1: a stateful-classified curve is routed, not refused.
+    assert!(venue.initialized(), "stateful strategy should be routable");
+
     let (side, amount, _) = f
         .swaps
         .iter()
@@ -286,7 +304,11 @@ async fn routes_stateful_strategy_alloc_free() {
         (f.quote_mint, f.base_mint)
     };
     let req = QuoteRequest { input_mint, output_mint, amount, swap_type: SwapType::ExactIn };
-    // The point: a stateful curve with non-empty userspace quotes alloc-free.
+
+    // Guard 2: alloc-free across the load + store + price path, with a
+    // non-empty userspace the copy actually moves.
     let q = assert_no_alloc(|| venue.quote(req)).expect("stateful quote should succeed");
     assert_eq!(q.amount, amount);
+    // Guard 3: the counter store leaves pricing flat 1:1.
+    assert_eq!(q.expected_output, amount, "counter curve still prices 1:1");
 }
