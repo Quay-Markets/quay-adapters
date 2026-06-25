@@ -250,7 +250,7 @@ async fn quote_does_not_allocate() {
 ///      used a `StoreI64` after `Halt` — dead code — and an empty copy);
 ///   3. the bookkeeping store doesn't perturb pricing (still 1:1).
 #[tokio::test]
-async fn routes_stateful_strategy_alloc_free() {
+async fn quote_is_alloc_free_for_stateful_curve() {
     // StrategyHeader: `bytecode_len` u32 LE @144, `userspace_len` @148, the
     // 192-byte header followed by bytecode then userspace as the account tail.
     const HEADER_LEN: usize = 192;
