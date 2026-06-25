@@ -21,19 +21,17 @@ use crate::opcode::Op;
 fn opcode_cost(op: Op) -> u64 {
     match op {
         // Scalar loads from Inputs.
-        Op::LoadInv
-        | Op::LoadSize
+        Op::LoadSize
         | Op::LoadSide
         | Op::LoadNowSlot
-        | Op::LoadVaultBase
-        | Op::LoadVaultQuote
         | Op::LoadInvBase
         | Op::LoadInvQuote
         | Op::LoadNowUnixSec
         | Op::LoadBaseDecimals
         | Op::LoadQuoteDecimals
-        | Op::LoadArenaTimestampSec
-        | Op::LoadLastUpdateSlot
+        | Op::LoadQuotesTimestampSec
+        | Op::LoadQuotesTimestampNanos
+        | Op::LoadLastTradeSlot
         | Op::LoadIxDepth
         | Op::LoadTxFlags => 5,
 
@@ -46,18 +44,16 @@ fn opcode_cost(op: Op) -> u64 {
         // LoadConst reads an 8-byte LE immediate.
         Op::LoadConst => 6,
 
-        // Arena slot load — bounds-check + indexed read.
-        Op::LoadArenaQuote | Op::LoadArenaQuoteU => 7,
+        // Quote box load — bounds-check + indexed read. The 2-box loads read
+        // two boxes and combine.
+        Op::LoadQuote | Op::LoadQuoteU => 7,
+        Op::LoadQuoteU64 | Op::LoadQuoteI64 => 9,
 
-        // Userspace byte/word reads — bounds check + N-byte read + sign-extend.
-        // Costs trend with width since LE decode is the dominant work.
-        Op::LoadI8 | Op::LoadU8 => 8,
-        Op::LoadI16 | Op::LoadU16 => 9,
-        Op::LoadI32 => 10,
-        Op::LoadI64 => 12,
+        // Userspace 8-byte reads — bounds check + LE decode + extend.
+        Op::LoadI64 | Op::LoadU64 => 12,
 
-        // Userspace i64 store — bounds-check + i128→i64 cast + 8-byte write.
-        Op::StoreI64 => 14,
+        // Userspace i64/u64 store — bounds-check + i128 range-check + 8-byte write.
+        Op::StoreI64 | Op::StoreU64 => 14,
 
         // Stack manipulation.
         Op::Dup | Op::Swap | Op::Drop | Op::Pick => 4,
@@ -91,6 +87,9 @@ fn opcode_cost(op: Op) -> u64 {
 
         // Sqrt.
         Op::Sqrt => 60,
+
+        // Pow — up to ~31 i128 square-and-multiply steps for a u32 exponent.
+        Op::Pow => 120,
 
         // Lookups — table header read (8 B) + ascending-check + walk.
         // Conservative cap based on MAX_TABLE_ENTRIES.

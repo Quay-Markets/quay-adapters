@@ -161,13 +161,14 @@ pub struct QuayVenue {
     base_mint: Pubkey,
     quote_mint: Pubkey,
 
-    /// Vault PDAs (base / quote sides) + cached account data so
-    /// `simulate_swap` can supply `vault_(base|quote)_atoms` to curves that
-    /// read them.
+    /// Vault PDAs (base / quote sides). The pricing VM no longer reads vault
+    /// balances (the `LoadVault*` opcodes were removed in the DSL-v1
+    /// redesign), so no vault data is cached — these keys exist only because
+    /// the on-chain `swap` ix still takes the vaults as positional accounts,
+    /// so they stay in `get_required_pubkeys_for_update` for the router's
+    /// account-set / lookup-table machinery.
     vault_base_key: Pubkey,
     vault_quote_key: Pubkey,
-    vault_base_data: Vec<u8>,
-    vault_quote_data: Vec<u8>,
 
     /// `[base, quote]` `TokenInfo` (mints + decimals + Token-2022 program
     /// detection). Populated by `update_state`; empty before the first call.
@@ -327,15 +328,6 @@ fn strategy_is_stateless(strategy: &StrategyHeader, strategy_data: &[u8]) -> boo
         .unwrap_or(false)
 }
 
-/// Read an SPL token account's `amount` (u64 LE at bytes 64..72). Caller
-/// must verify `data.len() >= 72`; replaces an earlier `try_into().unwrap()`
-/// against the zero-warnings policy.
-fn read_vault_atoms(data: &[u8]) -> u64 {
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&data[64..72]);
-    u64::from_le_bytes(buf)
-}
-
 // ──────────────────────────────────────────────────────────────────────────
 // FromAccount
 // ──────────────────────────────────────────────────────────────────────────
@@ -377,8 +369,6 @@ impl FromAccount for QuayVenue {
             quote_mint,
             vault_base_key,
             vault_quote_key,
-            vault_base_data: Vec::new(),
-            vault_quote_data: Vec::new(),
             tokens: Vec::new(),
             stateless,
             // Default to 1 (active-halt) so `initialized()` returns false
@@ -546,16 +536,15 @@ impl TradingVenue for QuayVenue {
         let quote_info = TokenInfo::new(&self.quote_mint, quote_mint_account, 0)?;
         self.tokens = vec![base_info, quote_info];
 
-        // Slots 6 + 7 — base and quote vaults. Needed for `LoadVaultBase` /
-        // `LoadVaultQuote`.
-        let vault_base_account = accounts[6]
-            .as_ref()
-            .ok_or_else(|| TradingVenueError::NoAccountFound(self.vault_base_key.into()))?;
-        let vault_quote_account = accounts[7]
-            .as_ref()
-            .ok_or_else(|| TradingVenueError::NoAccountFound(self.vault_quote_key.into()))?;
-        self.vault_base_data = vault_base_account.data.clone();
-        self.vault_quote_data = vault_quote_account.data.clone();
+        // Slots 6 + 7 — base and quote vaults. The VM no longer prices off
+        // vault balances, so we don't cache their data; we only verify the
+        // accounts exist, since the `swap` ix still needs them on-chain.
+        if accounts[6].is_none() {
+            return Err(TradingVenueError::NoAccountFound(self.vault_base_key.into()));
+        }
+        if accounts[7].is_none() {
+            return Err(TradingVenueError::NoAccountFound(self.vault_quote_key.into()));
+        }
 
         // Slot 8 — `Clock` sysvar. Replaces the `with_clock` / `set_clock`
         // path as the production source for `current_slot` /
@@ -637,16 +626,6 @@ impl TradingVenue for QuayVenue {
             .map(|t| t.decimals as u8)
             .ok_or_else(|| TradingVenueError::MissingState("quote TokenInfo".into()))?;
 
-        // Vault depths → `LoadVaultBase` / `LoadVaultQuote`. `amount` is
-        // u64 LE at offset 64..72 of every SPL Token / Token-2022 account.
-        if self.vault_base_data.len() < 72 || self.vault_quote_data.len() < 72 {
-            return Err(TradingVenueError::AmmMethodError(
-                "vault account data too short for LoadVault*".into(),
-            ));
-        }
-        let vault_base_atoms = read_vault_atoms(&self.vault_base_data);
-        let vault_quote_atoms = read_vault_atoms(&self.vault_quote_data);
-
         // Clock: live values from the `Clock` sysvar Titan's `AccountsCache`
         // fetched in `update_state`, or a `with_clock` / `set_clock`
         // override. `0` means "no update_state has run and no override was
@@ -661,8 +640,6 @@ impl TradingVenue for QuayVenue {
             side,
             amount_in: request.amount,
             min_amount_out: 0,
-            vault_base_atoms,
-            vault_quote_atoms,
             base_decimals,
             quote_decimals,
         })
@@ -820,8 +797,6 @@ mod tests {
             quote_mint: Pubkey::new_unique(),
             vault_base_key: Pubkey::new_unique(),
             vault_quote_key: Pubkey::new_unique(),
-            vault_base_data: Vec::new(),
-            vault_quote_data: Vec::new(),
             tokens: Vec::new(),
             stateless: true,
             cfg_swap_halted: 0,

@@ -9,25 +9,21 @@
 //! strategy's userspace, lets the curve mutate the clone, and returns the
 //! post-mutation bytes in [`SwapSimulation::userspace_post`].
 
-use quay_vm::{evaluate, Inputs, RuntimeError, TxContext, CURRENT_DSL_VERSION};
+use quay_vm::{evaluate, Inputs, TxContext, CURRENT_DSL_VERSION};
 
-use crate::consts::{FEE_BPS_DENOM, PRICE_SCALE, SIDE_BUY_BASE, SIDE_SELL_BASE};
+use crate::consts::{FEE_BPS_DENOM, SIDE_SELL_BASE};
 use crate::error::{ClientError, Result};
 use crate::state::{GlobalConfig, MarketMakerHeader, QuotesHeader, StrategyHeader};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwapSimulation {
-    /// OUT atoms the taker receives at `exec_price`.
+    /// OUT atoms the taker receives — the curve's `amount_out` for the net
+    /// input (`amount_in - protocol_cut`).
     pub out_to_taker: u64,
-    /// Protocol's slice of the half-spread, in OUT atoms. `0` when the
-    /// strategy's `protocol_fee_bps` is `0`.
+    /// Protocol fee skimmed from the input, in IN-token atoms. `0` when the
+    /// strategy's `protocol_fee_bps` is `0`. Accrues to the IN-side asset.
     pub protocol_cut: u64,
-    /// Curve's exec_price for the requested side (Q24).
-    pub exec_price: i64,
-    /// Opposite-side exec_price (Q24). `None` when no fee applies (no
-    /// opposite-side sim was run).
-    pub opp_exec_price: Option<i64>,
-    /// Userspace bytes after the real-side curve mutated them.
+    /// Userspace bytes after the curve mutated them.
     pub userspace_post: Vec<u8>,
 }
 
@@ -44,11 +40,6 @@ pub struct SwapSimulationInputs<'a> {
     pub side: u8,
     pub amount_in: u64,
     pub min_amount_out: u64,
-    /// Base-vault token balance in atoms (caller reads the vault token
-    /// account). Exposed to bytecode via `LoadVaultBase`.
-    pub vault_base_atoms: u64,
-    /// Quote-vault token balance in atoms. Exposed via `LoadVaultQuote`.
-    pub vault_quote_atoms: u64,
     /// Decimals of the base / quote mints (caller reads the mint accounts).
     pub base_decimals: u8,
     pub quote_decimals: u8,
@@ -98,61 +89,41 @@ pub fn simulate_swap(inputs: SwapSimulationInputs<'_>) -> Result<SwapSimulation>
         return Err(ClientError::QuotesNotPublished);
     }
     let quotes_buf = QuotesHeader::read_all_slots(inputs.quotes_data)?;
-    let arena_timestamp_sec = (quotes_hdr.updated_ts / 1_000_000_000) as i64;
 
     let bytecode = strategy.bytecode(inputs.strategy_data)?;
     let userspace_src = strategy.userspace(inputs.strategy_data)?;
 
-    let inv_real = inv_for(inputs.side, inventory_base, inventory_quote);
-    let inv_opp = inv_for(opposite(inputs.side), inventory_base, inventory_quote);
     let protocol_fee_bps = u16::min(strategy.protocol_fee_bps, 10_000);
 
-    macro_rules! mk_inputs {
-        ($us:expr, $inv:expr, $side:expr) => {
-            Inputs {
-                quotes: &quotes_buf,
-                userspace: $us,
-                inv: $inv,
-                size: inputs.amount_in as i64,
-                side: i64::from($side),
-                current_slot: inputs.current_slot as i64,
-                vault_base_atoms: i64::try_from(inputs.vault_base_atoms).unwrap_or(i64::MAX),
-                vault_quote_atoms: i64::try_from(inputs.vault_quote_atoms).unwrap_or(i64::MAX),
-                inventory_base,
-                inventory_quote,
-                current_unix_sec: inputs.current_unix_sec,
-                base_decimals: inputs.base_decimals,
-                quote_decimals: inputs.quote_decimals,
-                arena_timestamp_sec,
-                last_update_slot: strategy.last_update_slot,
-                tx: TxContext::DIRECT,
-            }
-        };
-    }
+    // Skim the protocol fee from the input (IN-token atoms); the curve prices
+    // the net input. Mirrors `swap.rs::protocol_fee` + the fee skim.
+    let protocol_cut = u64::try_from(
+        (u128::from(inputs.amount_in) * u128::from(protocol_fee_bps)) / u128::from(FEE_BPS_DENOM),
+    )
+    .map_err(|_| ClientError::SwapMathOverflow)?;
+    let net_in = inputs
+        .amount_in
+        .checked_sub(protocol_cut)
+        .ok_or(ClientError::SwapMathOverflow)?;
 
-    // Opposite-side sim first (on a clone). Skipped when no fee applies.
-    let opp_exec_price: Option<i64> = if protocol_fee_bps > 0 {
-        let mut opp_us = userspace_src.to_vec();
-        match evaluate(bytecode, mk_inputs!(&mut opp_us, inv_opp, opposite(inputs.side))) {
-            Ok(result) => Some(result.exec_price()),
-            // One-sided curve: no two-sided spread → zero protocol fee on
-            // this swap. Real VM faults (`Err(e)` below) still abort.
-            Err(RuntimeError::Reject(_)) => None,
-            Err(e) => return Err(e.into()),
-        }
-    } else {
-        None
-    };
-
-    // Real-side run on its own clone (so the post-state can be returned).
+    // Single run on a clone of userspace so the post-state can be returned.
     let mut userspace_clone = userspace_src.to_vec();
-    let exec_price = evaluate(bytecode, mk_inputs!(&mut userspace_clone, inv_real, inputs.side))?
-        .exec_price();
-    if exec_price <= 0 {
-        return Err(ClientError::InvalidExecPrice(exec_price));
-    }
-
-    let out_to_taker = apply_price(inputs.amount_in, exec_price, inputs.side)?;
+    let inputs_vm = Inputs {
+        quotes: &quotes_buf,
+        userspace: &mut userspace_clone,
+        size: net_in,
+        side: inputs.side,
+        current_slot: inputs.current_slot,
+        inventory_base,
+        inventory_quote,
+        current_unix_sec: inputs.current_unix_sec.max(0) as u64,
+        base_decimals: inputs.base_decimals,
+        quote_decimals: inputs.quote_decimals,
+        quotes_timestamp_ns: quotes_hdr.updated_ts,
+        last_update_slot: strategy.last_update_slot,
+        tx: TxContext::DIRECT,
+    };
+    let out_to_taker = evaluate(bytecode, inputs_vm)?.amount_out();
     if out_to_taker == 0 {
         return Err(ClientError::ZeroOutputSwap {
             amount_in: inputs.amount_in,
@@ -165,78 +136,30 @@ pub fn simulate_swap(inputs: SwapSimulationInputs<'_>) -> Result<SwapSimulation>
         });
     }
 
-    let protocol_cut: u64 = if let Some(opp) = opp_exec_price {
-        if opp <= 0 {
-            return Err(ClientError::InvalidExecPrice(opp));
-        }
-        let opp_out = apply_price(inputs.amount_in, opp, inputs.side)?;
-        let spread = (i128::from(opp_out) - i128::from(out_to_taker)).unsigned_abs();
-        let half = spread / 2;
-        let scaled = half
-            .checked_mul(u128::from(protocol_fee_bps))
-            .ok_or(ClientError::SwapMathOverflow)?;
-        u64::try_from(scaled / u128::from(FEE_BPS_DENOM))
-            .map_err(|_| ClientError::SwapMathOverflow)?
-    } else {
-        0
-    };
-
     // Mirror `settle_inventory`'s structural solvency gate: on-chain, the
-    // OUT-side asset entry is debited `out_to_taker + protocol_cut` with
-    // `checked_sub` (and the IN side credited with `checked_add`) — a swap
-    // the inventory can't cover fails at settlement. Without this gate the
-    // simulator quotes fills the program will refuse.
+    // OUT-side asset entry is debited `out_to_taker` with `checked_sub`, the
+    // IN side credited `net_in` (and `protocol_cut` accrued as fees) — a swap
+    // the inventory can't cover fails at settlement. The full `amount_in` lands
+    // in the IN vault. Without this gate the simulator quotes fills the program
+    // will refuse.
     let (inventory_in, inventory_out) = if inputs.side == SIDE_SELL_BASE {
         (inventory_base, inventory_quote)
     } else {
         (inventory_quote, inventory_base)
     };
-    let out_debit = out_to_taker
-        .checked_add(protocol_cut)
-        .ok_or(ClientError::SwapMathOverflow)?;
-    if out_debit > inventory_out {
+    if out_to_taker > inventory_out {
         return Err(ClientError::InsufficientInventory {
-            needed: out_debit,
+            needed: out_to_taker,
             available: inventory_out,
         });
     }
-    if inventory_in.checked_add(inputs.amount_in).is_none() {
+    if inventory_in.checked_add(net_in).is_none() {
         return Err(ClientError::SwapMathOverflow);
     }
 
     Ok(SwapSimulation {
         out_to_taker,
         protocol_cut,
-        exec_price,
-        opp_exec_price,
         userspace_post: userspace_clone,
     })
-}
-
-fn opposite(side: u8) -> u8 {
-    if side == SIDE_SELL_BASE {
-        SIDE_BUY_BASE
-    } else {
-        SIDE_SELL_BASE
-    }
-}
-
-fn inv_for(side: u8, base: u64, quote: u64) -> i64 {
-    let v = if side == SIDE_SELL_BASE { base } else { quote };
-    i64::try_from(v).unwrap_or(i64::MAX)
-}
-
-/// OUT atoms for `amount_in` at `exec_price` (Q24).
-fn apply_price(amount_in: u64, exec_price: i64, side: u8) -> Result<u64> {
-    let a = i128::from(amount_in);
-    let p = i128::from(exec_price);
-    let out = match side {
-        SIDE_SELL_BASE => a.checked_mul(p).and_then(|v| v.checked_div(PRICE_SCALE)),
-        _ => a.checked_mul(PRICE_SCALE).and_then(|v| v.checked_div(p)),
-    }
-    .ok_or(ClientError::SwapMathOverflow)?;
-    if out < 0 || out > i128::from(u64::MAX) {
-        return Err(ClientError::SwapMathOverflow);
-    }
-    Ok(out as u64)
 }

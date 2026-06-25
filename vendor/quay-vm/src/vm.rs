@@ -33,25 +33,27 @@
 
 use crate::opcode::{Op, MAX_STACK_DEPTH, MAX_STEPS, MAX_TABLE_ENTRIES};
 
-/// Value returned at a terminator: the curve's quoted exec price (Q24).
+/// Value returned at a terminator: the curve's `amount_out`, in OUT-token
+/// atoms.
 ///
-/// Pop'd from the top of the stack at `Op::Halt`. Always interpreted by
-/// the swap program as `quote_per_base × 2²⁴` — settled by `apply_price`.
+/// Pop'd from the top of the stack at `Op::Halt`. The curve computes the
+/// full output amount itself (folding in `size`, `side`, the mid, and any
+/// decimal scaling); the swap program credits it to the taker verbatim — no
+/// post-scaling step. It must be non-negative and fit `u64`; a negative or
+/// over-u64 value at `Op::Halt` is `RuntimeError::ResultOverflowsU64`.
 ///
-/// Wraps a raw `i64` so the swap program can't accidentally route the
-/// pop'd value to inventory math without going through the apply-price
-/// scaling step.
+/// Wraps `u64` so the swap program treats it as a settled token amount.
 ///
-/// Fees are derived **outside** the VM — the swap path runs the curve twice
-/// (once for the user's side, once for the opposite side on a cloned
-/// userspace), takes the half-spread between the two prices, and charges
-/// `protocol_fee_share_bps` of that. Curves no longer declare a fee amount.
+/// Fees are taken **outside** the VM: the swap path skims
+/// `amount_in × protocol_fee_bps / 10_000` from the input before pricing and
+/// runs the curve once on the net input. Curves are fee-agnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EvalResult(pub i64);
+pub struct EvalResult(pub u64);
 
 impl EvalResult {
-    /// The Q24 exec_price that landed on top of the stack at `Op::Halt`.
-    pub fn exec_price(&self) -> i64 {
+    /// The `amount_out` (OUT-token atoms) that landed on top of the stack at
+    /// `Op::Halt`.
+    pub fn amount_out(&self) -> u64 {
         self.0
     }
 }
@@ -80,6 +82,8 @@ pub enum RuntimeError {
     TierTableMalformed,
     /// i128 result didn't fit into i64 (overflow at the boundary).
     ResultOverflowsI64,
+    /// i128 result didn't fit into u64 (negative or > u64::MAX) on `StoreU64`.
+    ResultOverflowsU64,
     /// Curve-emitted abort via `Op::Reject <reason>`. The reason byte is
     /// passed through to the program-side `ProgramError::Custom(0xC000 | r)`
     /// mapping. `0x00..=0x7F` are protocol-defined "standard reasons" (see
@@ -148,27 +152,26 @@ impl TxContext<'_> {
 /// `init_strategy` and resizable via `resize_userspace`. Curves manage
 /// their own layout inside it.
 pub struct Inputs<'a> {
-    /// Quotes blob (read-only). Indexed by `LoadArenaQuote <u8>` into 241
-    /// `i32` slots.
+    /// Quotes blob (read-only). Indexed by `LoadQuote <u8>` into 241 `i32`
+    /// boxes; the 2-box loads read `[slot, slot+1]`.
     pub quotes: &'a [i32],
 
-    /// Strategy-owned R/W data region. Curves address bytes by `u32` offset
-    /// via `LoadI{8,16,32,64}` / `LoadU8` / `StoreI64`. Owner can also
-    /// rewrite ranges between swaps via `set_userspace`.
+    /// Strategy-owned R/W data region, addressed by `u32` byte offset via
+    /// `LoadI64` / `LoadU64` / `StoreI64` / `StoreU64`. Owner can also rewrite
+    /// ranges between swaps via `set_userspace`.
     pub userspace: &'a mut [u8],
 
-    pub inv: i64,
-    pub size: i64,
-    pub side: i64,
-    pub current_slot: i64,
-    pub vault_base_atoms: i64,
-    pub vault_quote_atoms: i64,
+    pub size: u64,
+    pub side: u8,
+    pub current_slot: u64,
     pub inventory_base: u64,
     pub inventory_quote: u64,
-    pub current_unix_sec: i64,
+    pub current_unix_sec: u64,
     pub base_decimals: u8,
     pub quote_decimals: u8,
-    pub arena_timestamp_sec: i64,
+    /// Quotes-account timestamp, nanoseconds since epoch. `LoadQuotesTimestampSec`
+    /// exposes `floor(/1e9)`; `LoadQuotesTimestampNanos` exposes this directly.
+    pub quotes_timestamp_ns: u64,
     pub last_update_slot: u64,
 
     /// Transaction-introspection context. Hosts that don't gather it pass
@@ -176,9 +179,9 @@ pub struct Inputs<'a> {
     pub tx: TxContext<'a>,
 }
 
-/// Run bytecode to completion. Returns the i64 on top of the stack at HALT
-/// (the curve's exec_price, Q24). Fees are derived outside the VM — see
-/// `EvalResult` doc.
+/// Run bytecode to completion. Returns the `amount_out` (OUT-token atoms) on
+/// top of the stack at HALT, range-checked into `u64`. Fees are taken outside
+/// the VM — see `EvalResult` doc.
 pub fn evaluate(bytecode: &[u8], inputs: Inputs<'_>) -> Result<EvalResult, RuntimeError> {
     let mut stack = [0i128; MAX_STACK_DEPTH as usize];
     let mut sp: usize = 0;
@@ -226,33 +229,57 @@ pub fn evaluate(bytecode: &[u8], inputs: Inputs<'_>) -> Result<EvalResult, Runti
         }
 
         match op {
-            Op::LoadArenaQuote => {
+            Op::LoadQuote => {
                 let i = bytecode[pc + 1] as usize;
                 if i >= inputs.quotes.len() {
                     return Err(RuntimeError::QuoteIndexOutOfBounds);
                 }
                 push!(inputs.quotes[i] as i128);
             }
-            Op::LoadArenaQuoteU => {
+            Op::LoadQuoteU => {
                 let i = bytecode[pc + 1] as usize;
                 if i >= inputs.quotes.len() {
                     return Err(RuntimeError::QuoteIndexOutOfBounds);
                 }
                 push!(inputs.quotes[i] as u32 as i128);
             }
-            Op::LoadInv => push!(inputs.inv as i128),
+            Op::LoadQuoteU64 => {
+                // Low box: raw 32 bits (masked to u32). High box: high 32 bits,
+                // zero-extended → u64. Bounds: both boxes must be in range.
+                let lo = bytecode[pc + 1] as usize;
+                let hi = lo + 1;
+                if hi >= inputs.quotes.len() {
+                    return Err(RuntimeError::QuoteIndexOutOfBounds);
+                }
+                let v = inputs.quotes[lo] as u32 as u64
+                    | ((inputs.quotes[hi] as u32 as u64) << 32);
+                push!(v as i128);
+            }
+            Op::LoadQuoteI64 => {
+                // Low box: raw 32 bits (masked to u32). High box: signed → the
+                // combined value is a proper i64 (high box carries the sign).
+                let lo = bytecode[pc + 1] as usize;
+                let hi = lo + 1;
+                if hi >= inputs.quotes.len() {
+                    return Err(RuntimeError::QuoteIndexOutOfBounds);
+                }
+                let v = inputs.quotes[lo] as u32 as u64
+                    | ((inputs.quotes[hi] as u32 as u64) << 32);
+                push!(v as i64 as i128);
+            }
             Op::LoadSize => push!(inputs.size as i128),
             Op::LoadSide => push!(inputs.side as i128),
             Op::LoadNowSlot => push!(inputs.current_slot as i128),
-            Op::LoadVaultBase => push!(inputs.vault_base_atoms as i128),
-            Op::LoadVaultQuote => push!(inputs.vault_quote_atoms as i128),
             Op::LoadInvBase => push!(inputs.inventory_base as i128),
             Op::LoadInvQuote => push!(inputs.inventory_quote as i128),
             Op::LoadNowUnixSec => push!(inputs.current_unix_sec as i128),
             Op::LoadBaseDecimals => push!(inputs.base_decimals as i128),
             Op::LoadQuoteDecimals => push!(inputs.quote_decimals as i128),
-            Op::LoadArenaTimestampSec => push!(inputs.arena_timestamp_sec as i128),
-            Op::LoadLastUpdateSlot => push!(inputs.last_update_slot as i128),
+            Op::LoadQuotesTimestampSec => {
+                push!((inputs.quotes_timestamp_ns / 1_000_000_000) as i128)
+            }
+            Op::LoadQuotesTimestampNanos => push!(inputs.quotes_timestamp_ns as i128),
+            Op::LoadLastTradeSlot => push!(inputs.last_update_slot as i128),
             Op::LoadIxDepth => push!(inputs.tx.ix_depth as i128),
             Op::LoadTxFlags => push!(inputs.tx.tx_flags as i128),
             Op::EntrypointIs => {
@@ -277,34 +304,14 @@ pub fn evaluate(bytecode: &[u8], inputs: Inputs<'_>) -> Result<EvalResult, Runti
                 push!(v as i128);
             }
 
-            Op::LoadI8 => {
-                let off = read_u32(bytecode, pc + 1) as usize;
-                let v = read_userspace_i8(inputs.userspace, off)?;
-                push!(v as i128);
-            }
-            Op::LoadU8 => {
-                let off = read_u32(bytecode, pc + 1) as usize;
-                let v = read_userspace_u8(inputs.userspace, off)?;
-                push!(v as i128);
-            }
-            Op::LoadU16 => {
-                let off = read_u32(bytecode, pc + 1) as usize;
-                let v = read_userspace_u16(inputs.userspace, off)?;
-                push!(v as i128);
-            }
-            Op::LoadI16 => {
-                let off = read_u32(bytecode, pc + 1) as usize;
-                let v = read_userspace_i16(inputs.userspace, off)?;
-                push!(v as i128);
-            }
-            Op::LoadI32 => {
-                let off = read_u32(bytecode, pc + 1) as usize;
-                let v = read_userspace_i32(inputs.userspace, off)?;
-                push!(v as i128);
-            }
             Op::LoadI64 => {
                 let off = read_u32(bytecode, pc + 1) as usize;
                 let v = read_userspace_i64(inputs.userspace, off)?;
+                push!(v as i128);
+            }
+            Op::LoadU64 => {
+                let off = read_u32(bytecode, pc + 1) as usize;
+                let v = read_userspace_u64(inputs.userspace, off)?;
                 push!(v as i128);
             }
             Op::StoreI64 => {
@@ -312,6 +319,12 @@ pub fn evaluate(bytecode: &[u8], inputs: Inputs<'_>) -> Result<EvalResult, Runti
                 let v = pop!();
                 let v64 = i128_to_i64(v)?;
                 write_userspace_i64(inputs.userspace, off, v64)?;
+            }
+            Op::StoreU64 => {
+                let off = read_u32(bytecode, pc + 1) as usize;
+                let v = pop!();
+                let v64 = i128_to_u64(v)?;
+                write_userspace_i64(inputs.userspace, off, v64 as i64)?;
             }
 
             Op::Dup => {
@@ -632,13 +645,27 @@ pub fn evaluate(bytecode: &[u8], inputs: Inputs<'_>) -> Result<EvalResult, Runti
                 }
                 push!(isqrt_i128(a));
             }
+            Op::Pow => {
+                // Integer exponentiation `base ^ exp`. Pop order: exp (top),
+                // base. The exponent must be non-negative and fit `u32`;
+                // anything else, or an overflow of the i128 result, is an
+                // `ArithmeticOverflow`.
+                let exp = pop!();
+                let base = pop!();
+                if exp < 0 || exp > u32::MAX as i128 {
+                    return Err(RuntimeError::ArithmeticOverflow);
+                }
+                push!(base
+                    .checked_pow(exp as u32)
+                    .ok_or(RuntimeError::ArithmeticOverflow)?);
+            }
             Op::Halt => {
                 if sp == 0 {
                     return Err(RuntimeError::StackUnderflow);
                 }
                 let v = stack[sp - 1];
-                let exec_price = i128_to_i64(v)?;
-                return Ok(EvalResult(exec_price));
+                let amount_out = i128_to_u64(v)?;
+                return Ok(EvalResult(amount_out));
             }
             Op::Reject => {
                 let reason = bytecode[pc + 1];
@@ -683,49 +710,6 @@ fn jump_target(
 }
 
 #[inline]
-fn read_userspace_i8(us: &[u8], off: usize) -> Result<i8, RuntimeError> {
-    us.get(off)
-        .copied()
-        .map(|b| b as i8)
-        .ok_or(RuntimeError::UserspaceOutOfBounds)
-}
-#[inline]
-fn read_userspace_u8(us: &[u8], off: usize) -> Result<u8, RuntimeError> {
-    us.get(off)
-        .copied()
-        .ok_or(RuntimeError::UserspaceOutOfBounds)
-}
-#[inline]
-fn read_userspace_i16(us: &[u8], off: usize) -> Result<i16, RuntimeError> {
-    let end = off
-        .checked_add(2)
-        .ok_or(RuntimeError::UserspaceOutOfBounds)?;
-    if end > us.len() {
-        return Err(RuntimeError::UserspaceOutOfBounds);
-    }
-    Ok(i16::from_le_bytes(us[off..end].try_into().unwrap()))
-}
-#[inline]
-fn read_userspace_u16(us: &[u8], off: usize) -> Result<u16, RuntimeError> {
-    let end = off
-        .checked_add(2)
-        .ok_or(RuntimeError::UserspaceOutOfBounds)?;
-    if end > us.len() {
-        return Err(RuntimeError::UserspaceOutOfBounds);
-    }
-    Ok(u16::from_le_bytes(us[off..end].try_into().unwrap()))
-}
-#[inline]
-fn read_userspace_i32(us: &[u8], off: usize) -> Result<i32, RuntimeError> {
-    let end = off
-        .checked_add(4)
-        .ok_or(RuntimeError::UserspaceOutOfBounds)?;
-    if end > us.len() {
-        return Err(RuntimeError::UserspaceOutOfBounds);
-    }
-    Ok(i32::from_le_bytes(us[off..end].try_into().unwrap()))
-}
-#[inline]
 fn read_userspace_i64(us: &[u8], off: usize) -> Result<i64, RuntimeError> {
     let end = off
         .checked_add(8)
@@ -734,6 +718,16 @@ fn read_userspace_i64(us: &[u8], off: usize) -> Result<i64, RuntimeError> {
         return Err(RuntimeError::UserspaceOutOfBounds);
     }
     Ok(i64::from_le_bytes(us[off..end].try_into().unwrap()))
+}
+#[inline]
+fn read_userspace_u64(us: &[u8], off: usize) -> Result<u64, RuntimeError> {
+    let end = off
+        .checked_add(8)
+        .ok_or(RuntimeError::UserspaceOutOfBounds)?;
+    if end > us.len() {
+        return Err(RuntimeError::UserspaceOutOfBounds);
+    }
+    Ok(u64::from_le_bytes(us[off..end].try_into().unwrap()))
 }
 #[inline]
 fn write_userspace_i64(us: &mut [u8], off: usize, v: i64) -> Result<(), RuntimeError> {
@@ -797,6 +791,14 @@ fn i128_to_i64(v: i128) -> Result<i64, RuntimeError> {
         return Err(RuntimeError::ResultOverflowsI64);
     }
     Ok(v as i64)
+}
+
+#[inline]
+fn i128_to_u64(v: i128) -> Result<u64, RuntimeError> {
+    if v < 0 || v > u64::MAX as i128 {
+        return Err(RuntimeError::ResultOverflowsU64);
+    }
+    Ok(v as u64)
 }
 
 /// Read a tier/lerp table header at userspace `off`. Returns (n, table_start)

@@ -9,6 +9,13 @@
 //! an amount sweep on both sides — `out: null` means the on-chain swap
 //! FAILED, and the adapter must refuse to quote it (or quote zero output).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test code: panic on assertion failure is the desired behavior"
+)]
+
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 

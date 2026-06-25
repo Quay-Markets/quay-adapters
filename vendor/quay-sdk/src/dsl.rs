@@ -71,24 +71,24 @@ impl BytecodeBuilder {
         self
     }
 
-    // ── Arena loads ─────────────────────────────────────────────────────────
-    pub fn load_arena_quote(self, idx: u8) -> Self { self.imm_u8(Op::LoadArenaQuote, idx) }
-    pub fn load_arena_quote_u(self, idx: u8) -> Self { self.imm_u8(Op::LoadArenaQuoteU, idx) }
-    pub fn load_arena_timestamp_sec(self) -> Self { self.op(Op::LoadArenaTimestampSec) }
+    // ── Quote loads ─────────────────────────────────────────────────────────
+    pub fn load_quote(self, idx: u8) -> Self { self.imm_u8(Op::LoadQuote, idx) }
+    pub fn load_quote_u(self, idx: u8) -> Self { self.imm_u8(Op::LoadQuoteU, idx) }
+    pub fn load_quote_u64(self, idx: u8) -> Self { self.imm_u8(Op::LoadQuoteU64, idx) }
+    pub fn load_quote_i64(self, idx: u8) -> Self { self.imm_u8(Op::LoadQuoteI64, idx) }
+    pub fn load_quotes_timestamp_sec(self) -> Self { self.op(Op::LoadQuotesTimestampSec) }
+    pub fn load_quotes_timestamp_nanos(self) -> Self { self.op(Op::LoadQuotesTimestampNanos) }
 
     // ── Input-register loads ────────────────────────────────────────────────
-    pub fn load_inv(self) -> Self { self.op(Op::LoadInv) }
     pub fn load_inv_base(self) -> Self { self.op(Op::LoadInvBase) }
     pub fn load_inv_quote(self) -> Self { self.op(Op::LoadInvQuote) }
     pub fn load_size(self) -> Self { self.op(Op::LoadSize) }
     pub fn load_side(self) -> Self { self.op(Op::LoadSide) }
-    pub fn load_vault_base(self) -> Self { self.op(Op::LoadVaultBase) }
-    pub fn load_vault_quote(self) -> Self { self.op(Op::LoadVaultQuote) }
     pub fn load_now_slot(self) -> Self { self.op(Op::LoadNowSlot) }
     pub fn load_now_unix_sec(self) -> Self { self.op(Op::LoadNowUnixSec) }
     pub fn load_base_decimals(self) -> Self { self.op(Op::LoadBaseDecimals) }
     pub fn load_quote_decimals(self) -> Self { self.op(Op::LoadQuoteDecimals) }
-    pub fn load_last_update_slot(self) -> Self { self.op(Op::LoadLastUpdateSlot) }
+    pub fn load_last_trade_slot(self) -> Self { self.op(Op::LoadLastTradeSlot) }
     pub fn load_const(self, v: i64) -> Self { self.imm_i64(Op::LoadConst, v) }
 
     // ── Transaction introspection (TxContext) ───────────────────────────────
@@ -128,13 +128,10 @@ impl BytecodeBuilder {
     }
 
     // ── Userspace loads / stores ───────────────────────────────────────────
-    pub fn load_i8(self, off: u32) -> Self { self.imm_u32(Op::LoadI8, off) }
-    pub fn load_i16(self, off: u32) -> Self { self.imm_u32(Op::LoadI16, off) }
-    pub fn load_i32(self, off: u32) -> Self { self.imm_u32(Op::LoadI32, off) }
     pub fn load_i64(self, off: u32) -> Self { self.imm_u32(Op::LoadI64, off) }
-    pub fn load_u8(self, off: u32) -> Self { self.imm_u32(Op::LoadU8, off) }
-    pub fn load_u16(self, off: u32) -> Self { self.imm_u32(Op::LoadU16, off) }
+    pub fn load_u64(self, off: u32) -> Self { self.imm_u32(Op::LoadU64, off) }
     pub fn store_i64(self, off: u32) -> Self { self.imm_u32(Op::StoreI64, off) }
+    pub fn store_u64(self, off: u32) -> Self { self.imm_u32(Op::StoreU64, off) }
 
     // ── Stack manipulation ──────────────────────────────────────────────────
     pub fn dup(self) -> Self { self.op(Op::Dup) }
@@ -154,6 +151,7 @@ impl BytecodeBuilder {
     pub fn mul(self) -> Self { self.op(Op::Mul) }
     pub fn div(self) -> Self { self.op(Op::Div) }
     pub fn muldiv(self) -> Self { self.op(Op::Muldiv) }
+    pub fn pow(self) -> Self { self.op(Op::Pow) }
     pub fn div_ceil(self) -> Self { self.op(Op::DivCeil) }
     pub fn mod_op(self) -> Self { self.op(Op::Mod) }
     pub fn neg(self) -> Self { self.op(Op::Neg) }

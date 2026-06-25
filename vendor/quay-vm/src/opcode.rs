@@ -18,25 +18,25 @@ pub const MAX_STEPS: u32 = 1024;
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
-    // ── Loads from arena (writer-controlled, read-only) ────────────────────
-    LoadArenaQuote = 0x01,  // imm: u8 — sign-extend i32 slot
-    LoadArenaQuoteU = 0x28, // imm: u8 — zero-extend
-    LoadArenaTimestampSec = 0x29,
+    // ── Quote loads (quotes account, read-only) ────────────────────────────
+    LoadQuote = 0x01,    // imm: u8 box — sign-extend i32
+    LoadQuoteU = 0x28,   // imm: u8 box — zero-extend u32
+    LoadQuoteU64 = 0x52, // imm: u8 low box — [slot, slot+1] as u64 (zero-extend)
+    LoadQuoteI64 = 0x53, // imm: u8 low box — [slot, slot+1] as i64 (high box signs)
+    LoadQuotesTimestampSec = 0x29, // floor(quotes_timestamp_ns / 1e9) as u64
+    LoadQuotesTimestampNanos = 0x54, // quotes_timestamp_ns as u64 (full resolution)
 
     // ── Loads from VM inputs (swap-time context) ───────────────────────────
-    LoadInv = 0x02, // side-relative inventory (legacy)
     LoadSize = 0x03,
     LoadSide = 0x04,
     LoadConst = 0x05, // imm: i64
     LoadNowSlot = 0x27,
     LoadNowUnixSec = 0x31,
-    LoadVaultBase = 0x2D,
-    LoadVaultQuote = 0x2E,
     LoadInvBase = 0x2F,
     LoadInvQuote = 0x30,
     LoadBaseDecimals = 0x32,
     LoadQuoteDecimals = 0x33,
-    LoadLastUpdateSlot = 0x42,
+    LoadLastTradeSlot = 0x42,
 
     // ── Transaction-introspection loads (host-gathered TxContext) ──────────
     //
@@ -60,15 +60,12 @@ pub enum Op {
     // returns `RuntimeError::UserspaceOutOfBounds`. There is no install-time
     // pre-proof — owner can rewrite userspace cheaply (incl. mid-swap via
     // `StoreI64`); the dispatcher protects itself.
-    LoadI8 = 0x43,  // imm: u32 — sign-extend byte
-    LoadI16 = 0x44, // imm: u32 — sign-extend i16 LE
-    LoadI32 = 0x45, // imm: u32 — sign-extend i32 LE
-    LoadI64 = 0x46, // imm: u32 — i64 LE
-    LoadU8 = 0x47,  // imm: u32 — zero-extend byte
-    LoadU16 = 0x4A, // imm: u32 — zero-extend u16 LE
+    LoadI64 = 0x46, // imm: u32 — 8B LE, sign-extend to i128
+    LoadU64 = 0x50, // imm: u32 — 8B LE, zero-extend to i128
 
     // ── Userspace stores ────────────────────────────────────────────────────
-    StoreI64 = 0x48, // imm: u32 — write i64 LE; bounds-checked
+    StoreI64 = 0x48, // imm: u32 — pop i128, range-check i64, write 8B LE
+    StoreU64 = 0x55, // imm: u32 — pop i128, range-check u64, write 8B LE
 
     // ── Stack manipulation ──────────────────────────────────────────────────
     Dup = 0x09,
@@ -92,6 +89,7 @@ pub enum Op {
     Sqrt = 0x24,
     DivCeil = 0x3B,
     Mod = 0x3C,
+    Pow = 0x56, // base ^ exp (exp non-negative, fits u32); pops exp, base
 
     // ── Fixed-point / Q-format helpers ─────────────────────────────────────
     //
@@ -162,15 +160,15 @@ pub enum Op {
     Jmp = 0x22, // imm: i16
 
     // ── Terminators ─────────────────────────────────────────────────────────
-    Halt = 0x23,   // pop top of stack as Q24 exec_price
+    Halt = 0x23,   // pop top of stack as amount_out (OUT-token atoms, u64)
     Reject = 0x34, // imm: u8 (reason); maps to Custom(0xC000 | r)
 
     // ── Assertions ──────────────────────────────────────────────────────────
     //
     // Sugar over the common defensive-guard pattern (`compare → IfEq jump
     // around → REJECT`). Compose with the CMP* opcodes to express e.g.
-    // `assert vault_quote >= 1000`:
-    //   LoadVaultQuote, LoadConst 1000, CmpGe, AssertNonzero(reason).
+    // `assert inv_quote >= 1000`:
+    //   LoadInvQuote, LoadConst 1000, CmpGe, AssertNonzero(reason).
     AssertNonzero = 0x49, // imm: u8 (reason); pop v, REJECT(r) if v == 0
 }
 
@@ -183,8 +181,7 @@ impl Op {
     /// need compile-time opcode resolution.
     pub const fn from_byte_const(b: u8) -> Option<Self> {
         Some(match b {
-            0x01 => Op::LoadArenaQuote,
-            0x02 => Op::LoadInv,
+            0x01 => Op::LoadQuote,
             0x03 => Op::LoadSize,
             0x04 => Op::LoadSide,
             0x05 => Op::LoadConst,
@@ -219,10 +216,8 @@ impl Op {
             0x24 => Op::Sqrt,
             0x26 => Op::TierLookupDyn,
             0x27 => Op::LoadNowSlot,
-            0x28 => Op::LoadArenaQuoteU,
-            0x29 => Op::LoadArenaTimestampSec,
-            0x2d => Op::LoadVaultBase,
-            0x2e => Op::LoadVaultQuote,
+            0x28 => Op::LoadQuoteU,
+            0x29 => Op::LoadQuotesTimestampSec,
             0x2f => Op::LoadInvBase,
             0x30 => Op::LoadInvQuote,
             0x31 => Op::LoadNowUnixSec,
@@ -238,19 +233,20 @@ impl Op {
             0x3b => Op::DivCeil,
             0x3c => Op::Mod,
             0x3d => Op::LerpLookup,
-            0x42 => Op::LoadLastUpdateSlot,
-            0x43 => Op::LoadI8,
-            0x44 => Op::LoadI16,
-            0x45 => Op::LoadI32,
+            0x42 => Op::LoadLastTradeSlot,
             0x46 => Op::LoadI64,
-            0x47 => Op::LoadU8,
             0x48 => Op::StoreI64,
             0x49 => Op::AssertNonzero,
-            0x4a => Op::LoadU16,
             0x4c => Op::LoadIxDepth,
             0x4d => Op::LoadTxFlags,
             0x4e => Op::EntrypointIs,
             0x4f => Op::IsSignedBy,
+            0x50 => Op::LoadU64,
+            0x52 => Op::LoadQuoteU64,
+            0x53 => Op::LoadQuoteI64,
+            0x54 => Op::LoadQuotesTimestampNanos,
+            0x55 => Op::StoreU64,
+            0x56 => Op::Pow,
             0x25 => Op::TierLookup2,
             0x3e => Op::MulShr,
             0x3f => Op::MulQ48,
@@ -272,16 +268,15 @@ impl Op {
             Op::TierLookup
             | Op::LerpLookup
             | Op::TierLookup2
-            | Op::LoadI8
-            | Op::LoadI16
-            | Op::LoadI32
             | Op::LoadI64
-            | Op::LoadU8
-            | Op::LoadU16
-            | Op::StoreI64 => 5,
+            | Op::LoadU64
+            | Op::StoreI64
+            | Op::StoreU64 => 5,
             // u8 imm
-            Op::LoadArenaQuote
-            | Op::LoadArenaQuoteU
+            Op::LoadQuote
+            | Op::LoadQuoteU
+            | Op::LoadQuoteU64
+            | Op::LoadQuoteI64
             | Op::Reject
             | Op::AssertNonzero
             | Op::MulShr
@@ -301,35 +296,31 @@ impl Op {
     pub fn stack_delta(self) -> (u8, u8) {
         match self {
             // Pure loads (0 → 1)
-            Op::LoadArenaQuote
-            | Op::LoadArenaQuoteU
-            | Op::LoadInv
+            Op::LoadQuote
+            | Op::LoadQuoteU
+            | Op::LoadQuoteU64
+            | Op::LoadQuoteI64
             | Op::LoadSize
             | Op::LoadSide
             | Op::LoadConst
             | Op::LoadNowSlot
             | Op::LoadNowUnixSec
-            | Op::LoadVaultBase
-            | Op::LoadVaultQuote
             | Op::LoadInvBase
             | Op::LoadInvQuote
             | Op::LoadBaseDecimals
             | Op::LoadQuoteDecimals
-            | Op::LoadArenaTimestampSec
-            | Op::LoadLastUpdateSlot
-            | Op::LoadI8
-            | Op::LoadI16
-            | Op::LoadI32
+            | Op::LoadQuotesTimestampSec
+            | Op::LoadQuotesTimestampNanos
+            | Op::LoadLastTradeSlot
             | Op::LoadI64
-            | Op::LoadU8
-            | Op::LoadU16
+            | Op::LoadU64
             | Op::LoadIxDepth
             | Op::LoadTxFlags
             | Op::EntrypointIs
             | Op::IsSignedBy => (0, 1),
 
             // Stores (1 → 0)
-            Op::StoreI64 | Op::Drop => (1, 0),
+            Op::StoreI64 | Op::StoreU64 | Op::Drop => (1, 0),
 
             // Stack ops
             Op::Dup => (1, 2),
@@ -362,7 +353,8 @@ impl Op {
             | Op::Mod
             | Op::MulShr
             | Op::MulQ48
-            | Op::DivQ48 => (2, 1),
+            | Op::DivQ48
+            | Op::Pow => (2, 1),
 
             // Ternary (3 → 1)
             Op::Muldiv | Op::Clamp | Op::Select | Op::MuladdQ48 => (3, 1),
@@ -393,7 +385,7 @@ impl Op {
     /// routed MMs commit to bytecode that contains no such opcode — see
     /// `is_stateless` for the bytecode-level check.
     pub const fn mutates_userspace(self) -> bool {
-        matches!(self, Op::StoreI64)
+        matches!(self, Op::StoreI64 | Op::StoreU64)
     }
 
 }
@@ -511,6 +503,7 @@ mod stateless_tests {
             Op::Sqrt,
             Op::DivCeil,
             Op::Mod,
+            Op::Pow,
             Op::And,
             Op::Or,
             Op::Xor,
@@ -529,19 +522,17 @@ mod stateless_tests {
             Op::CmpGe,
             Op::CmpEq,
             Op::Select,
-            Op::LoadInv,
             Op::LoadSize,
             Op::LoadSide,
             Op::LoadNowSlot,
             Op::LoadNowUnixSec,
-            Op::LoadVaultBase,
-            Op::LoadVaultQuote,
             Op::LoadInvBase,
             Op::LoadInvQuote,
             Op::LoadBaseDecimals,
             Op::LoadQuoteDecimals,
-            Op::LoadArenaTimestampSec,
-            Op::LoadLastUpdateSlot,
+            Op::LoadQuotesTimestampSec,
+            Op::LoadQuotesTimestampNanos,
+            Op::LoadLastTradeSlot,
             Op::TierLookupDyn,
             Op::MulQ48,
             Op::DivQ48,

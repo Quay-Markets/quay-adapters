@@ -21,6 +21,7 @@ pub mod dsl;
 pub mod error;
 pub mod ix;
 pub mod pda;
+pub mod quotes;
 pub mod simulate;
 pub mod state;
 
