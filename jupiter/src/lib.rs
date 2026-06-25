@@ -123,15 +123,6 @@ fn mint_has_transfer_fee(token_program: &Pubkey, data: &[u8]) -> bool {
     false
 }
 
-/// Read an SPL token account's `amount` (u64 LE at bytes 64..72). Caller is
-/// responsible for the length check — both `swap` callers verify
-/// `data.len() >= 72` upfront. Replaces an earlier `try_into().unwrap()`
-/// against the zero-warnings policy.
-fn read_vault_atoms(data: &[u8]) -> u64 {
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&data[64..72]);
-    u64::from_le_bytes(buf)
-}
 
 /// Quay's mainnet program id (placeholder until deployment locks it in).
 ///
@@ -166,14 +157,13 @@ pub struct QuayAmm {
     /// of the mint account. Read once per update and fed to `simulate_swap`.
     base_decimals: u8,
     quote_decimals: u8,
-    /// Cached vault PDAs + their token-account data so the simulator can
-    /// supply `vault_(base|quote)_atoms` to curves that read them. The
-    /// pubkeys are derived once at construction; the bytes are refreshed by
-    /// `update()` every slot Jupiter polls.
+    /// Cached vault PDAs. The pricing VM no longer reads vault balances
+    /// (the `LoadVault*` opcodes were removed in the DSL-v1 redesign), so no
+    /// vault data is cached — these keys exist only because the on-chain
+    /// `swap` ix still takes the vaults as positional accounts, so they stay
+    /// in `get_accounts_to_update` for the router.
     vault_base_key: Pubkey,
     vault_quote_key: Pubkey,
-    vault_base_data: Vec<u8>,
-    vault_quote_data: Vec<u8>,
     /// Cached `AmmContext.clock_ref` so `quote` can read current slot +
     /// unix timestamp without re-threading them through the API.
     clock: jupiter_amm_interface::ClockRef,
@@ -332,8 +322,6 @@ impl Amm for QuayAmm {
             quote_decimals: 0,
             vault_base_key,
             vault_quote_key,
-            vault_base_data: Vec::new(),
-            vault_quote_data: Vec::new(),
             clock: amm_context.clock_ref.clone(),
             strategy_frozen: strategy.frozen,
             strategy_frozen_admin: strategy.frozen_admin,
@@ -412,11 +400,11 @@ impl Amm for QuayAmm {
         self.cfg_swap_halted = cfg.swap_halted;
         self.cfg_protocol_halted = cfg.protocol_halted;
 
-        // Vaults — needed for `LoadVaultBase` / `LoadVaultQuote`.
-        let vault_base_data = try_get_account_data(account_map, &self.vault_base_key)?;
-        self.vault_base_data = vault_base_data.to_vec();
-        let vault_quote_data = try_get_account_data(account_map, &self.vault_quote_key)?;
-        self.vault_quote_data = vault_quote_data.to_vec();
+        // Vaults are no longer priced (the VM dropped `LoadVault*`), but the
+        // `swap` ix still takes them on-chain, so we keep them in
+        // `get_accounts_to_update` and only verify they're present.
+        try_get_account_data(account_map, &self.vault_base_key)?;
+        try_get_account_data(account_map, &self.vault_quote_key)?;
 
         // Mints — owner = token program (mixed-program correctness), and
         // `data[44]` = decimals (both SPL Token and Token-2022 store it there).
@@ -470,14 +458,6 @@ impl Amm for QuayAmm {
         let current_slot = self.clock.slot.load(Ordering::Relaxed);
         let current_unix_sec = self.clock.unix_timestamp.load(Ordering::Relaxed);
 
-        // Vault depths → `LoadVaultBase` / `LoadVaultQuote`. `amount` is
-        // u64 LE at offset 64..72 of every SPL Token / Token-2022 account.
-        if self.vault_base_data.len() < 72 || self.vault_quote_data.len() < 72 {
-            return Err(anyhow!("vault account data too short for LoadVault*"));
-        }
-        let vault_base_atoms = read_vault_atoms(&self.vault_base_data);
-        let vault_quote_atoms = read_vault_atoms(&self.vault_quote_data);
-
         let sim = simulate_swap(SwapSimulationInputs {
             strategy_data: &self.strategy_data,
             market_maker_data: &self.mm_data,
@@ -488,19 +468,18 @@ impl Amm for QuayAmm {
             side,
             amount_in: quote_params.amount,
             min_amount_out: 0,
-            vault_base_atoms,
-            vault_quote_atoms,
             base_decimals: self.base_decimals,
             quote_decimals: self.quote_decimals,
         })
         .map_err(|e| anyhow!("simulate_swap: {e}"))?;
 
-        // Protocol cut always lands on the OUT side of the swap.
-        // SELL_BASE (0) → OUT is quote; BUY_BASE (1) → OUT is base.
+        // Protocol cut is skimmed from the INPUT (DSL-v1 fee model): the fee
+        // accrues to the IN-side asset, denominated in IN-token atoms.
+        // SELL_BASE (0) → IN is base; BUY_BASE (1) → IN is quote.
         let fee_mint = if side == SIDE_SELL_BASE {
-            self.quote_mint
-        } else {
             self.base_mint
+        } else {
+            self.quote_mint
         };
         Ok(Quote {
             in_amount: quote_params.amount,
@@ -627,8 +606,6 @@ mod tests {
             quote_decimals: 0,
             vault_base_key: zero,
             vault_quote_key: zero,
-            vault_base_data: Vec::new(),
-            vault_quote_data: Vec::new(),
             clock: jupiter_amm_interface::ClockRef::default(),
             strategy_frozen: 0,
             strategy_frozen_admin: 0,

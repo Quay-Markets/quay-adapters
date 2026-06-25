@@ -89,6 +89,8 @@ pub fn init_quotes(program_id: &Pubkey, quotes: &Pubkey, owner: &Pubkey) -> Inst
 }
 
 /// `update_quotes` (0x04). `blob` must be exactly `QUOTES_NUM_SLOTS` entries.
+/// `batch_ts` is **epoch nanoseconds by contract** (only monotonicity is
+/// enforced on-chain) — curves read it via `LoadQuotesTimestamp{Sec,Nanos}`.
 pub fn update_quotes(
     program_id: &Pubkey,
     quotes: &Pubkey,
@@ -128,19 +130,17 @@ pub fn close_quotes(program_id: &Pubkey, quotes: &Pubkey, owner: &Pubkey) -> Ins
 // MarketMaker
 // ────────────────────────────────────────────────────────────────────────────
 
-/// `init_market_maker` (0x07). Admin-only — admin signs + pays rent, `owner`
-/// is a passive reference. The MM is born frozen; the owner unfreezes via
-/// `edit_market_maker_status`.
-pub fn init_market_maker(program_id: &Pubkey, admin: &Pubkey, owner: &Pubkey) -> Instruction {
+/// `init_market_maker` (0x07). Permissionless — the `owner` signs and pays for
+/// their own MM (the PDA is seeded by it). Born frozen by both owner (`frozen`)
+/// and admin (`frozen_admin`): the admin enables it via `set_market_maker_admin`
+/// and the owner via `edit_market_maker_status` before it can swap.
+pub fn init_market_maker(program_id: &Pubkey, owner: &Pubkey) -> Instruction {
     let (mm, _) = pda::market_maker_pda(program_id, owner);
-    let (cfg, _) = pda::global_config_pda(program_id);
     Instruction {
         program_id: *program_id,
         accounts: vec![
             meta_w(&mm),
-            meta_r(&cfg),
-            meta_r(owner),
-            meta_signer_w(admin),
+            meta_signer_w(owner),
             meta_r(&system_program::ID),
         ],
         data: vec![DISC_INIT_MARKET_MAKER],
@@ -292,7 +292,7 @@ pub fn withdraw_protocol_fees(
 const INIT_STRATEGY_PREFIX: usize = 1 + 2 + 2 + 4 + 4;
 
 /// `init_strategy` (0x10). The MM `owner` signs and pays for its own strategy;
-/// the MM must be live (not frozen/halted). Born frozen by the owner, and also
+/// the MM must not be halted (a frozen/pending MM may still onboard). Born frozen by the owner, and also
 /// `frozen_admin` unless the MM is permissionless (set by the admin). The
 /// protocol fee is taken from `GlobalConfig.default_protocol_fee_bps`.
 /// `quotes_account` optionally binds a feed at creation.

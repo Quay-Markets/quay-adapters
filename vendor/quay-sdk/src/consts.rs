@@ -58,7 +58,13 @@ pub const FEE_BPS_DENOM: u64 = 10_000;
 /// Maximum strategy userspace region, in bytes (1 MiB).
 pub const MAX_USERSPACE_LEN: u32 = 1 << 20;
 
-// ── Swap pricing scale ───────────────────────────────────────────────────────
+// ── Curve price scale (Q24) ──────────────────────────────────────────────────
+//
+// The VM now returns `amount_out` directly, so this is NOT a settlement
+// constant. It is the conventional fixed-point scale curves use internally for
+// a `quote_per_base` mid; the `amount_out` epilogue
+// (`dsl_templates::amount_out_epilogue`) converts a Q24 price into `amount_out`
+// via `size * price / 2^24` (SELL) / `size * 2^24 / price` (BUY).
 pub const PRICE_SCALE_BITS: u32 = 24;
 pub const PRICE_SCALE: i128 = 1i128 << PRICE_SCALE_BITS;
 

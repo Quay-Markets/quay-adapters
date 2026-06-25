@@ -66,7 +66,7 @@ fn program_so_path() -> Option<PathBuf> {
         return p.exists().then_some(p);
     }
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    
+
     // 2. The copy bundled next to the fixtures — makes the standalone export
     //    repo self-contained (no env var, no monorepo checkout).
     let bundled = manifest.join("../fixtures/quay_program.so");

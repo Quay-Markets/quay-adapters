@@ -188,9 +188,6 @@ pub enum ClientError {
     #[error("integer overflow in swap math")]
     SwapMathOverflow,
 
-    #[error("non-positive exec_price emitted by curve: {0}")]
-    InvalidExecPrice(i64),
-
     #[error("slippage: out_to_taker {got} < min_amount_out {min}")]
     SlippageExceeded { got: u64, min: u64 },
 
