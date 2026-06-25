@@ -102,3 +102,7 @@ litesvm = "0.6"
 solana-keypair = "2.2"
 solana-signer = "2.2"
 solana-transaction = "2.2"
+# `tests/mainnet.rs` (ignored by default) drives the adapter against live Quay
+# strategies over JSON-RPC. `ureq` is a tiny blocking HTTP(S) client; the test
+# reads `RPC_URL` from the environment and skips when it is unset.
+ureq = { version = "2", features = ["json"] }
