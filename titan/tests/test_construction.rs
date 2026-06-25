@@ -228,35 +228,40 @@ async fn quote_does_not_allocate() {
     }
 }
 
-/// The aggregator-routing contract: a stateful curve must be refused. We take
-/// the `flat` fixture's (stateless) strategy and splice a `StoreI64` opcode
-/// into its bytecode — the venue must then report uninitialized and refuse to
-/// quote, exactly as it does for halts and transfer-fee mints.
+/// All curves are routable — including stateful ones — and `quote()` prices
+/// them with zero heap allocation on a fixed stack buffer. We take the `flat`
+/// fixture's strategy, splice a `StoreI64` into its bytecode (so the old
+/// statelessness gate would have refused it) and grow `userspace_len` so the
+/// no-alloc path actually copies a non-empty userspace, then assert the venue
+/// initializes and quotes without allocating.
 #[tokio::test]
-async fn refuses_stateful_strategy() {
-    // StrategyHeader layout: `bytecode_len` is a u32 LE at offset 144,
-    // `userspace_len` at 148. The `flat` fixture has userspace_len == 0, so the
-    // bytecode is the account's tail — appending an opcode keeps the layout
-    // self-consistent.
+async fn routes_stateful_strategy_alloc_free() {
+    // StrategyHeader layout: `bytecode_len` u32 LE at offset 144,
+    // `userspace_len` at 148. The `flat` fixture has bytecode_len=10,
+    // userspace_len=0, with bytecode then userspace as the account's tail.
     const BYTECODE_LEN_OFF: usize = 144;
-    const OP_STORE_I64: u8 = 0x48; // `StoreI64` — the only userspace-mutating op.
+    const USERSPACE_LEN_OFF: usize = 148;
+    const OP_STORE_I64: u8 = 0x48; // a userspace-mutating op → bytecode is "stateful".
+    const US_LEN: u32 = 16;
 
     let mut f = load_fixture("flat");
     let mut strat = f.accounts.get(&f.strategy).expect("strategy").clone();
 
-    let old_len = u32::from_le_bytes(
+    let bc_len = u32::from_le_bytes(
         strat.data[BYTECODE_LEN_OFF..BYTECODE_LEN_OFF + 4]
             .try_into()
             .unwrap(),
     );
-    // `StoreI64` is opcode + u32 immediate = 5 bytes; append it and grow the
-    // declared bytecode length to match.
+    // Append `StoreI64 <0>` (opcode + u32 imm) *after* the curve's `Halt` — dead
+    // code at runtime, but it makes the bytecode stateful by `is_stateless`.
     strat.data.extend_from_slice(&[OP_STORE_I64, 0, 0, 0, 0]);
     strat.data[BYTECODE_LEN_OFF..BYTECODE_LEN_OFF + 4]
-        .copy_from_slice(&(old_len + 5).to_le_bytes());
+        .copy_from_slice(&(bc_len + 5).to_le_bytes());
+    // Grow userspace so the no-alloc copy handles a non-empty buffer.
+    strat.data.extend_from_slice(&[0u8; US_LEN as usize]);
+    strat.data[USERSPACE_LEN_OFF..USERSPACE_LEN_OFF + 4].copy_from_slice(&US_LEN.to_le_bytes());
     f.accounts.insert(f.strategy, strat.clone());
 
-    // Construction already sees the stateful bytecode.
     let mut venue = QuayVenue::from_account(&f.strategy, &strat).expect("from_account");
     venue
         .update_state(&MapCache(f.accounts.clone()))
@@ -264,8 +269,8 @@ async fn refuses_stateful_strategy() {
         .expect("update_state");
 
     assert!(
-        !venue.initialized(),
-        "stateful strategy must report uninitialized"
+        venue.initialized(),
+        "stateful strategy should now be routable"
     );
     let (side, amount, _) = f
         .swaps
@@ -278,8 +283,8 @@ async fn refuses_stateful_strategy() {
     } else {
         (f.quote_mint, f.base_mint)
     };
-    let err = venue
-        .quote(QuoteRequest { input_mint, output_mint, amount, swap_type: SwapType::ExactIn })
-        .expect_err("stateful strategy must refuse to quote");
-    let _ = err; // surface is `NotInitialized`; we only require a refusal.
+    let req = QuoteRequest { input_mint, output_mint, amount, swap_type: SwapType::ExactIn };
+    // The point: a stateful curve with non-empty userspace quotes alloc-free.
+    let q = assert_no_alloc(|| venue.quote(req)).expect("stateful quote should succeed");
+    assert_eq!(q.amount, amount);
 }

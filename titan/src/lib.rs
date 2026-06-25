@@ -18,10 +18,10 @@
 //! 3. the strategy's bound **Quotes** account,
 //! 4. **GlobalConfig** (halt flags),
 //! 5. + 6. the base and quote **mints** (decimals + Token-2022 detection),
-//! 7. + 8. the base and quote **vault** token accounts (`LoadVault*` inputs),
+//! 7. + 8. the base and quote **vault** token accounts (swap-ix accounts only — the VM no longer prices off vault balances),
 //! 9. the **`Clock` sysvar** — `update_state` decodes `slot` + `unix_timestamp`
-//!    here and threads them into `simulate_swap` so curves using
-//!    `LoadNowSlot` / `LoadNowUnixSec` / `LoadArenaTimestampSec` see the
+//!    here and threads them into `simulate_swap_in` so curves using
+//!    `LoadNowSlot` / `LoadNowUnixSec` / `LoadQuotesTimestampSec` see the
 //!    same numbers a real swap would. The sysvar is a well-known account
 //!    so Titan's cache dedups it across all Quay venues — one fetch per
 //!    slot, not per venue.
@@ -54,11 +54,12 @@ use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 
-use quay_sdk::consts::{SIDE_BUY_BASE, SIDE_SELL_BASE, SWAP_LOADED_ACCOUNTS_DATA_SIZE_LIMIT};
+use quay_sdk::consts::{
+    MAX_USERSPACE_LEN, SIDE_BUY_BASE, SIDE_SELL_BASE, SWAP_LOADED_ACCOUNTS_DATA_SIZE_LIMIT,
+};
 use quay_sdk::ix;
-use quay_sdk::is_stateless;
 use quay_sdk::pda;
-use quay_sdk::simulate::{simulate_swap, SwapSimulationInputs};
+use quay_sdk::simulate::{simulate_swap_in, SwapSimulationInputs};
 use quay_sdk::state::{GlobalConfig, MarketMakerHeader, StrategyHeader};
 
 use titan_integration_template::account_caching::AccountsCache;
@@ -134,7 +135,7 @@ fn decode_clock(data: &[u8]) -> Option<(u64, i64)> {
 /// `Account`) and then refreshed via `update_state` every slot. The four
 /// raw account blobs (`strategy_data` / `mm_data` / `quotes_data` /
 /// `global_config_data`) are kept in-struct because
-/// `quay_sdk::simulate::simulate_swap` reads them as opaque `&[u8]`.
+/// `quay_sdk::simulate::simulate_swap_in` reads them as opaque `&[u8]`.
 #[derive(Clone)]
 pub struct QuayVenue {
     /// Quay program id. Pulled off `Strategy.account.owner` at construction
@@ -174,26 +175,6 @@ pub struct QuayVenue {
     /// detection). Populated by `update_state`; empty before the first call.
     tokens: Vec<TokenInfo>,
 
-    /// Is the strategy's pricing bytecode **stateless** (no `StoreI64`
-    /// userspace writes)? Computed via `quay_vm::is_stateless` at construction
-    /// and refreshed each `update_state`.
-    ///
-    /// Aggregator adapters must refuse **stateful** curves — this is the VM's
-    /// documented "aggregator-routing contract" (`quay_vm::is_stateless`): a
-    /// router caches `simulate_swap` between the quote and the on-chain fill,
-    /// but a stateful curve mutates `userspace` mid-swap, so on-chain state
-    /// drifts from the cached view and the user's fill diverges from the
-    /// quote. Stateful curves are meant for direct integrations, not routers.
-    /// (Refusing them also keeps `quote()` allocation-free: `simulate_swap`
-    /// clones a non-empty `userspace` only for stateful curves, which would
-    /// break Titan's no-heap-in-quoting rule.)
-    ///
-    /// Unlike the halt bytes, this needs no warm-up default: the pricing
-    /// bytecode lives in the Strategy account `from_account` already holds, so
-    /// it is computed correctly at construction. (It still gates nothing until
-    /// `has_all_state()` is also true post-`update_state`.)
-    stateless: bool,
-
     /// Cached halt / freeze bytes — same set the on-chain `execute_swap`
     /// enforces, mirroring `aggregators/jupiter`'s [`QuayAmm`]. Every flag
     /// must read 0 for `initialized()` to return true. Bytes are sourced
@@ -211,7 +192,7 @@ pub struct QuayVenue {
     mm_frozen_admin: u8,
     mm_halted_admin: u8,
 
-    /// Wall clock the venue threads into `simulate_swap`. Production source
+    /// Wall clock the venue threads into `simulate_swap_in`. Production source
     /// is the `Clock` sysvar, fetched alongside the strategy / mm / vault
     /// blobs in `update_state` (see [`SYSVAR_CLOCK_ID`]). Callers running
     /// outside the Titan pipeline — replay tests, off-line backtests —
@@ -295,7 +276,7 @@ impl QuayVenue {
             .map(TokenInfo::get_token_program)
     }
 
-    /// Override the wall clock the venue feeds into `simulate_swap`.
+    /// Override the wall clock the venue feeds into `simulate_swap_in`.
     /// Production routers don't need this — `update_state` fetches the
     /// `Clock` sysvar through Titan's `AccountsCache` and updates both
     /// fields every slot. Useful for replay tests / off-line backtests
@@ -315,17 +296,6 @@ impl QuayVenue {
         self.current_slot = current_slot;
         self.current_unix_sec = current_unix_sec;
     }
-}
-
-/// Whether a strategy's pricing bytecode is stateless (carries no `StoreI64`
-/// userspace write). Conservatively returns `false` when the bytecode region
-/// can't be read — an undecodable strategy is treated as ineligible for
-/// routing, matching `quay_vm::is_stateless`'s own malformed-input handling.
-fn strategy_is_stateless(strategy: &StrategyHeader, strategy_data: &[u8]) -> bool {
-    strategy
-        .bytecode(strategy_data)
-        .map(is_stateless)
-        .unwrap_or(false)
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -353,8 +323,6 @@ impl FromAccount for QuayVenue {
         let (vault_base_key, _) = pda::vault_pda(&program_id, &mm_key, &base_mint);
         let (vault_quote_key, _) = pda::vault_pda(&program_id, &mm_key, &quote_mint);
 
-        let stateless = strategy_is_stateless(strategy, &account.data);
-
         Ok(Self {
             program_id,
             strategy_key: *pubkey,
@@ -370,7 +338,6 @@ impl FromAccount for QuayVenue {
             vault_base_key,
             vault_quote_key,
             tokens: Vec::new(),
-            stateless,
             // Default to 1 (active-halt) so `initialized()` returns false
             // until the first `update_state` decodes real flag bytes.
             cfg_swap_halted: 1,
@@ -395,21 +362,17 @@ impl FromAccount for QuayVenue {
 #[async_trait]
 impl TradingVenue for QuayVenue {
     fn initialized(&self) -> bool {
-        // Four gates Titan's route planner uses to skip the venue:
+        // Three gates Titan's route planner uses to skip the venue:
         //   1. all account blobs populated (post-first-update),
         //   2. on-chain halt / freeze set clear (the same flags the swap
         //      handler checks — see `onchain/program/src/instructions/swap.rs`),
         //   3. neither mint carries a Token-2022 `TransferFeeConfig`
         //      extension (the on-chain swap prices `amount_in` gross and
-        //      would short-fill against the curve's quoted output),
-        //   4. the pricing curve is stateless (see `stateless` — the VM's
-        //      aggregator-routing contract: a router caches the quote, so a
-        //      stateful curve's mid-swap userspace writes would drift the
-        //      fill away from the quote).
-        self.has_all_state()
-            && self.halts_clear()
-            && !self.any_transfer_fee()
-            && self.stateless
+        //      would short-fill against the curve's quoted output).
+        // Stateful curves are routed too: `quote()` prices them allocation-free
+        // on a stack buffer (see `quote`), and the on-chain `min_amount_out`
+        // guard bounds any quote/fill drift to a reverted route, not a loss.
+        self.has_all_state() && self.halts_clear() && !self.any_transfer_fee()
     }
 
     fn program_id(&self) -> Pubkey {
@@ -486,9 +449,6 @@ impl TradingVenue for QuayVenue {
         })?;
         self.strategy_frozen = strategy.frozen;
         self.strategy_frozen_admin = strategy.frozen_admin;
-        // Bytecode can change via `update_strategy_bytecode`, so re-derive the
-        // statelessness gate every refresh, not just at construction.
-        self.stateless = strategy_is_stateless(strategy, &self.strategy_data);
 
         // Slot 1 — MarketMaker (asset table + admin halts).
         let mm_account = accounts[1]
@@ -597,17 +557,10 @@ impl TradingVenue for QuayVenue {
         };
 
         // Mirror `initialized()`: state populated AND halts clear AND no
-        // transfer-fee mints AND a stateless curve. The simulator would also
-        // reject on the halt bytes (`client/sdk/src/simulate.rs`), but failing
-        // here gives the router a single canonical "not initialized" surface
-        // to skip. Refusing stateful curves before `simulate_swap` also keeps
-        // this path allocation-free (the simulator clones a non-empty
-        // userspace only for stateful curves).
-        if !self.has_all_state()
-            || !self.halts_clear()
-            || self.any_transfer_fee()
-            || !self.stateless
-        {
+        // transfer-fee mints. The simulator would also reject on the halt bytes
+        // (`client/sdk/src/simulate.rs`), but failing here gives the router a
+        // single canonical "not initialized" surface to skip.
+        if !self.has_all_state() || !self.halts_clear() || self.any_transfer_fee() {
             return Err(TradingVenueError::NotInitialized(self.strategy_key.into()));
         }
 
@@ -626,23 +579,32 @@ impl TradingVenue for QuayVenue {
             .map(|t| t.decimals as u8)
             .ok_or_else(|| TradingVenueError::MissingState("quote TokenInfo".into()))?;
 
+        // Price into a stack scratch buffer so `quote()` performs no heap
+        // allocation — Titan's real-time-quoting requirement — for every curve,
+        // stateful or not. `MAX_USERSPACE_LEN` (16 KiB) is the program's hard
+        // cap on userspace, so the buffer fits any strategy.
+        //
         // Clock: live values from the `Clock` sysvar Titan's `AccountsCache`
-        // fetched in `update_state`, or a `with_clock` / `set_clock`
-        // override. `0` means "no update_state has run and no override was
-        // attached" — curves fall back to `strategy.last_update_slot`.
-        let sim = simulate_swap(SwapSimulationInputs {
-            strategy_data: &self.strategy_data,
-            market_maker_data: &self.mm_data,
-            quotes_data: &self.quotes_data,
-            global_config_data: &self.global_config_data,
-            current_slot: self.current_slot,
-            current_unix_sec: self.current_unix_sec,
-            side,
-            amount_in: request.amount,
-            min_amount_out: 0,
-            base_decimals,
-            quote_decimals,
-        })
+        // fetched in `update_state`, or a `with_clock` / `set_clock` override.
+        // `0` means "no update_state has run and no override was attached" —
+        // curves fall back to `strategy.last_update_slot`.
+        let mut scratch = [0u8; MAX_USERSPACE_LEN as usize];
+        let sim = simulate_swap_in(
+            SwapSimulationInputs {
+                strategy_data: &self.strategy_data,
+                market_maker_data: &self.mm_data,
+                quotes_data: &self.quotes_data,
+                global_config_data: &self.global_config_data,
+                current_slot: self.current_slot,
+                current_unix_sec: self.current_unix_sec,
+                side,
+                amount_in: request.amount,
+                min_amount_out: 0,
+                base_decimals,
+                quote_decimals,
+            },
+            &mut scratch,
+        )
         .map_err(|e| TradingVenueError::AmmMethodError(format!("simulate_swap: {e}").into()))?;
 
         Ok(QuoteResult {
@@ -798,7 +760,6 @@ mod tests {
             vault_base_key: Pubkey::new_unique(),
             vault_quote_key: Pubkey::new_unique(),
             tokens: Vec::new(),
-            stateless: true,
             cfg_swap_halted: 0,
             cfg_protocol_halted: 0,
             strategy_frozen: 0,
@@ -850,20 +811,6 @@ mod tests {
         let mut venue = all_active_venue();
         venue.mm_data.clear();
         assert!(!venue.initialized(), "empty mm_data should fail initialized()");
-    }
-
-    #[test]
-    fn initialized_false_when_stateful() {
-        // A stateful curve (one that writes userspace via `StoreI64`) violates
-        // the VM's aggregator-routing contract — the router caches the quote,
-        // so mid-swap userspace writes drift the on-chain fill. The venue must
-        // refuse to route it.
-        let mut venue = all_active_venue();
-        venue.stateless = false;
-        assert!(
-            !venue.initialized(),
-            "stateful curve should fail initialized()"
-        );
     }
 
     #[test]

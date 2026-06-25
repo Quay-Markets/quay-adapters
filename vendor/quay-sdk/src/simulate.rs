@@ -5,15 +5,30 @@
 //! split for a `(Strategy, MarketMaker, Quotes, GlobalConfig)` set — without
 //! sending a tx.
 //!
-//! Stateful curves (`Op::StoreI64`) are supported: the simulator clones the
-//! strategy's userspace, lets the curve mutate the clone, and returns the
-//! post-mutation bytes in [`SwapSimulation::userspace_post`].
+//! Stateful curves (`Op::StoreI64` / `Op::StoreU64`) are supported: the curve
+//! mutates a writable userspace buffer. [`simulate_swap`] allocates that buffer
+//! and returns the post-mutation bytes in [`SwapSimulation::userspace_post`];
+//! [`simulate_swap_in`] prices into a caller-supplied buffer instead, so it
+//! performs **no heap allocation** — the hot path for aggregator adapters whose
+//! `quote()` must be real-time.
 
 use quay_vm::{evaluate, Inputs, TxContext, CURRENT_DSL_VERSION};
 
 use crate::consts::{FEE_BPS_DENOM, SIDE_SELL_BASE};
 use crate::error::{ClientError, Result};
 use crate::state::{GlobalConfig, MarketMakerHeader, QuotesHeader, StrategyHeader};
+
+/// The price + fee split of a simulated swap — the no-alloc result of
+/// [`simulate_swap_in`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwapQuote {
+    /// OUT atoms the taker receives — the curve's `amount_out` for the net
+    /// input (`amount_in - protocol_cut`).
+    pub out_to_taker: u64,
+    /// Protocol fee skimmed from the input, in IN-token atoms. `0` when the
+    /// strategy's `protocol_fee_bps` is `0`. Accrues to the IN-side asset.
+    pub protocol_cut: u64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwapSimulation {
@@ -54,6 +69,46 @@ pub struct SwapSimulationInputs<'a> {
 /// widen, never tighten). To evaluate a curve under a synthetic context,
 /// call `quay_vm::evaluate` with raw `Inputs` directly.
 pub fn simulate_swap(inputs: SwapSimulationInputs<'_>) -> Result<SwapSimulation> {
+    let strategy = StrategyHeader::try_from_account(inputs.strategy_data)?;
+    let mut userspace = strategy.userspace(inputs.strategy_data)?.to_vec();
+    let SwapQuote {
+        out_to_taker,
+        protocol_cut,
+    } = simulate_priced(&inputs, &mut userspace)?;
+    Ok(SwapSimulation {
+        out_to_taker,
+        protocol_cut,
+        userspace_post: userspace,
+    })
+}
+
+/// Allocation-free [`simulate_swap`]: prices into a caller-provided `scratch`
+/// buffer instead of cloning the strategy's userspace, and returns only the
+/// price (no `userspace_post`). The hot path for aggregator adapters, whose
+/// `quote()` must not touch the heap.
+///
+/// `scratch` must be at least `strategy.userspace_len` bytes; a buffer of
+/// [`crate::consts::MAX_USERSPACE_LEN`] fits any strategy. Returns
+/// `InvalidInput` if it is too small.
+pub fn simulate_swap_in(inputs: SwapSimulationInputs<'_>, scratch: &mut [u8]) -> Result<SwapQuote> {
+    let strategy = StrategyHeader::try_from_account(inputs.strategy_data)?;
+    let src = strategy.userspace(inputs.strategy_data)?;
+    let userspace = scratch.get_mut(..src.len()).ok_or(ClientError::InvalidInput(
+        "scratch buffer smaller than strategy userspace",
+    ))?;
+    userspace.copy_from_slice(src);
+    simulate_priced(&inputs, userspace)
+}
+
+/// Shared pricing core. `userspace` holds the strategy's current userspace
+/// bytes in a writable buffer the curve may mutate. Mirrors `quay-program`'s
+/// on-chain `swap` path step for step.
+///
+/// Evaluates under [`TxContext::DIRECT`] — quoting happens before the
+/// transaction exists, so context-gated curves price their benign "direct
+/// taker" branch (gates widen, never tighten). To evaluate a curve under a
+/// synthetic context, call `quay_vm::evaluate` with raw `Inputs` directly.
+fn simulate_priced(inputs: &SwapSimulationInputs<'_>, userspace: &mut [u8]) -> Result<SwapQuote> {
     if inputs.side > 1 {
         return Err(ClientError::InvalidInput("side must be 0 or 1"));
     }
@@ -91,7 +146,6 @@ pub fn simulate_swap(inputs: SwapSimulationInputs<'_>) -> Result<SwapSimulation>
     let quotes_buf = QuotesHeader::read_all_slots(inputs.quotes_data)?;
 
     let bytecode = strategy.bytecode(inputs.strategy_data)?;
-    let userspace_src = strategy.userspace(inputs.strategy_data)?;
 
     let protocol_fee_bps = u16::min(strategy.protocol_fee_bps, 10_000);
 
@@ -106,11 +160,9 @@ pub fn simulate_swap(inputs: SwapSimulationInputs<'_>) -> Result<SwapSimulation>
         .checked_sub(protocol_cut)
         .ok_or(ClientError::SwapMathOverflow)?;
 
-    // Single run on a clone of userspace so the post-state can be returned.
-    let mut userspace_clone = userspace_src.to_vec();
     let inputs_vm = Inputs {
         quotes: &quotes_buf,
-        userspace: &mut userspace_clone,
+        userspace,
         size: net_in,
         side: inputs.side,
         current_slot: inputs.current_slot,
@@ -157,9 +209,8 @@ pub fn simulate_swap(inputs: SwapSimulationInputs<'_>) -> Result<SwapSimulation>
         return Err(ClientError::SwapMathOverflow);
     }
 
-    Ok(SwapSimulation {
+    Ok(SwapQuote {
         out_to_taker,
         protocol_cut,
-        userspace_post: userspace_clone,
     })
 }
