@@ -2913,7 +2913,9 @@ dependencies = [
 
 [[package]]
 name = "quay-vm"
-version = "0.0.1"
+version = "0.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fbc6dbc7305698af1426c60457092b9af3dbc3666c186cd3441057ce37bddbe7"
 
 [[package]]
 name = "quinn"
