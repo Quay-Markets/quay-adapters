@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["titan", "vendor/quay-sdk", "vendor/quay-vm"]
+members = ["titan", "vendor/quay-sdk"]
 # `jupiter` is its own workspace (own Cargo.lock): `jupiter-amm-interface 0.6`
 # pins `solana-instruction = 2.2.1` exactly, which conflicts with the 2.3.x
 # line the titan template graph resolves. Build it from `jupiter/`.

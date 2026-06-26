@@ -9,7 +9,7 @@ description = "Off-chain client for the Quay program: instruction builders, acco
 path = "src/lib.rs"
 
 [dependencies]
-quay-vm = { path = "../quay-vm", default-features = false, features = ["std"] }
+quay-vm = { version = "0.0.2", default-features = false, features = ["std"] }
 solana-program = "2.1"
 bytemuck = { version = "1", features = ["derive"] }
 thiserror = "1"
